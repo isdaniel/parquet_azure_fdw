@@ -1,6 +1,6 @@
 # parquet_azure_fdw
 
-PostgreSQL Foreign Data Wrapper for Parquet blobs in Azure Blob Storage. Written in Rust with [pgrx](https://github.com/pgcentralfoundation/pgrx) 0.18.1.
+PostgreSQL Foreign Data Wrapper for Parquet blobs in Azure Blob Storage. Written in Rust with [pgrx](https://github.com/pgcentralfoundation/pgrx).
 
 ## Status
 

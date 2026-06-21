@@ -1,5 +1,5 @@
 # cargo-deny configuration for parquet_azure_fdw.
-# Run locally with: cargo deny --config cargo-deny.toml check
+# Run locally with: cargo deny check
 
 [graph]
 all-features = false
@@ -8,7 +8,12 @@ no-default-features = false
 [advisories]
 version = 2
 yanked = "warn"
-ignore = []
+ignore = [
+    # paste: unmaintained, no replacement available. Transitive via parquet (arrow stack).
+    "RUSTSEC-2024-0436",
+    # serde_cbor: unmaintained. Transitive via azure_core → typespec_client_core.
+    "RUSTSEC-2021-0127",
+]
 
 [licenses]
 version = 2
@@ -27,6 +32,8 @@ allow = [
     "OpenSSL",
     "CC0-1.0",
     "MPL-2.0",
+    # webpki-root-certs (via reqwest → azure_core) ships Mozilla's CA bundle.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
