@@ -1,0 +1,5 @@
+comment = 'Foreign data wrapper for Parquet files in Azure Blob Storage'
+default_version = '0.1.0'
+module_pathname = '$libdir/parquet_azure_fdw'
+relocatable = false
+superuser = false

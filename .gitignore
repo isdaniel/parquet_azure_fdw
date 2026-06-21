@@ -1,0 +1,5 @@
+target/
+*.swp
+.pgrx/
+.env.local
+.env

@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test (pg${{ matrix.pg }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17, 18]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry/build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: pg${{ matrix.pg }}
+
+      - name: Install PostgreSQL ${{ matrix.pg }}
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt jammy-pgdg main" >> /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update
+          sudo apt-get install -y \
+            postgresql-${{ matrix.pg }} \
+            postgresql-server-dev-${{ matrix.pg }} \
+            build-essential clang llvm libreadline-dev zlib1g-dev pkg-config libssl-dev
+
+      - name: Cache .pgrx
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx
+          key: pgrx-${{ runner.os }}-pg${{ matrix.pg }}-0.18.1
+
+      - name: Install cargo-pgrx 0.18.1
+        run: cargo install cargo-pgrx --version 0.18.1 --locked
+
+      - name: pgrx init
+        run: cargo pgrx init --pg${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Loosen PG dir perms (pgrx install target)
+        run: sudo chmod 777 /usr/share/postgresql/${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }} -R
+
+      - name: Clippy
+        run: cargo clippy --no-default-features --all-targets --features pg${{ matrix.pg }} -- -D warnings
+
+      # NOTE: testcontainers (used by the in-crate test harness) spawns Azurite
+      # from inside the test process, so we do not declare a `services:` block.
+      # Docker is preinstalled on ubuntu-22.04 runners.
+      #
+      # AZURE_TEST_SAS_URL is an OPTIONAL live-Azure smoke gate (T22). If the
+      # repo secret is not configured, the live-smoke test no-ops; do not fail.
+      - name: Test (pgrx test)
+        env:
+          AZURE_TEST_SAS_URL: ${{ secrets.AZURE_TEST_SAS_URL }}
+        run: cargo pgrx test --features pg_test --no-default-features --features pg${{ matrix.pg }} pg${{ matrix.pg }}
+
+  quality:
+    name: quality (fmt / clippy / cargo-deny)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry/build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: quality
+
+      - name: fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --config cargo-deny.toml
+  asan:
+    name: asan (pg17, informational)
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly (for -Z sanitizer=address)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry/build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: asan-pg17
+
+      - name: Install PostgreSQL 17
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt jammy-pgdg main" >> /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update
+          sudo apt-get install -y \
+            postgresql-17 \
+            postgresql-server-dev-17 \
+            build-essential clang llvm libreadline-dev zlib1g-dev pkg-config libssl-dev
+
+      - name: Cache .pgrx
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx
+          key: pgrx-${{ runner.os }}-pg17-asan-0.18.1
+
+      - name: Install cargo-pgrx 0.18.1
+        run: cargo install cargo-pgrx --version 0.18.1 --locked
+
+      - name: pgrx init (pg17)
+        run: cargo pgrx init --pg17 /usr/lib/postgresql/17/bin/pg_config
+
+      - name: Loosen PG dir perms (pgrx install target)
+        run: sudo chmod 777 /usr/share/postgresql/17 /usr/lib/postgresql/17 -R
+
+      # testcontainers spawns Azurite from inside the test process; no
+      # `services:` block needed (matches the `test` job above).
+      - name: pgrx test under AddressSanitizer
+        env:
+          RUSTFLAGS: "-Z sanitizer=address"
+          ASAN_OPTIONS: "detect_leaks=1:strict_string_checks=1:halt_on_error=0"
+        run: cargo +nightly pgrx test --release --features pg_test --no-default-features --features pg17 pg17

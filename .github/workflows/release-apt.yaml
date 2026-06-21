@@ -1,0 +1,153 @@
+name: Release apt repo
+
+# Triggered after Release artifacts exist for a tag. Publishes a signed
+# Debian-style apt repository to the `gh-pages` branch (consumed by users
+# adding e.g. `deb https://<org>.github.io/parquet_azure_fdw stable main`).
+#
+# NOTE(task-20): build-deb.sh and publish-repo.sh are STUBS. The standard
+# dpkg-deb / gpg / dpkg-scanpackages plumbing is left to whoever finalizes
+# the apt rollout (requires the APT_GPG_PRIVATE_KEY secret to be provisioned
+# and the gh-pages branch to be initialized).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check-tag:
+    name: check tag
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - id: resolve
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          case "$TAG" in
+            v*) ;;
+            *) echo "::error::tag must start with 'v' (got: $TAG)"; exit 1 ;;
+          esac
+          PRE=false
+          case "$TAG" in
+            *-rc*|*-beta*|*-alpha*) PRE=true ;;
+          esac
+          echo "tag=$TAG"          >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE"   >> "$GITHUB_OUTPUT"
+
+  build-deb:
+    name: build .deb (pg${{ matrix.pg }})
+    needs: check-tag
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17, 18]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry/build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: deb-pg${{ matrix.pg }}
+
+      - name: Install PostgreSQL ${{ matrix.pg }}
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt jammy-pgdg main" >> /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update
+          sudo apt-get install -y \
+            postgresql-${{ matrix.pg }} \
+            postgresql-server-dev-${{ matrix.pg }} \
+            build-essential clang llvm libreadline-dev zlib1g-dev pkg-config libssl-dev \
+            dpkg-dev
+
+      - name: Cache .pgrx
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx
+          key: pgrx-${{ runner.os }}-pg${{ matrix.pg }}-0.18.1
+
+      - name: Install cargo-pgrx 0.18.1
+        run: cargo install cargo-pgrx --version 0.18.1 --locked
+
+      - name: pgrx init
+        run: cargo pgrx init --pg${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Loosen PG dir perms (pgrx install target)
+        run: sudo chmod 777 /usr/share/postgresql/${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }} -R
+
+      - name: Package via pgrx
+        run: cargo pgrx package --pg-config=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Build .deb
+        env:
+          PG_VER: ${{ matrix.pg }}
+          TAG: ${{ needs.check-tag.outputs.tag }}
+        run: bash packaging/deb/build-deb.sh
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: parquet-azure-fdw-pg${{ matrix.pg }}-deb
+          path: dist/*.deb
+
+  publish-apt:
+    name: publish apt repo (gh-pages)
+    needs: [check-tag, build-deb]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all .deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: incoming/
+
+      - name: Install apt repo tooling
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev gnupg
+
+      - name: Import GPG signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APT_GPG_PRIVATE_KEY:-}" ]; then
+            echo "::error::APT_GPG_PRIVATE_KEY secret is not set; cannot sign apt repo."
+            exit 1
+          fi
+          echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Assemble + sign apt repo
+        env:
+          TAG: ${{ needs.check-tag.outputs.tag }}
+          PRERELEASE: ${{ needs.check-tag.outputs.prerelease }}
+        run: bash packaging/apt/publish-repo.sh
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./public
+          keep_files: true

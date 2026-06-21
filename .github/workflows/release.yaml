@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build (pg${{ matrix.pg }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17, 18]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry/build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-pg${{ matrix.pg }}
+
+      - name: Install PostgreSQL ${{ matrix.pg }}
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt jammy-pgdg main" >> /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update
+          sudo apt-get install -y \
+            postgresql-${{ matrix.pg }} \
+            postgresql-server-dev-${{ matrix.pg }} \
+            build-essential clang llvm libreadline-dev zlib1g-dev pkg-config libssl-dev
+
+      - name: Cache .pgrx
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx
+          key: pgrx-${{ runner.os }}-pg${{ matrix.pg }}-0.18.1
+
+      - name: Install cargo-pgrx 0.18.1
+        run: cargo install cargo-pgrx --version 0.18.1 --locked
+
+      - name: pgrx init
+        run: cargo pgrx init --pg${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Loosen PG dir perms (pgrx install target)
+        run: sudo chmod 777 /usr/share/postgresql/${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }} -R
+
+      - name: Package
+        run: cargo pgrx package --pg-config=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: parquet_azure_fdw-pg${{ matrix.pg }}
+          path: target/release/parquet_azure_fdw-pg${{ matrix.pg }}/
+
+  release:
+    name: create GitHub release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Archive artifacts
+        run: |
+          set -euo pipefail
+          for d in parquet_azure_fdw-pg*; do
+            tar czf "${d}-${GITHUB_REF_NAME}-linux-amd64.tar.gz" "$d"
+          done
+          ls -lh *.tar.gz
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*.tar.gz'
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
