@@ -2130,6 +2130,7 @@ dependencies = [
  "parquet",
  "pgrx",
  "pgrx-tests",
+ "regex",
  "roaring",
  "rstest",
  "serde_json",

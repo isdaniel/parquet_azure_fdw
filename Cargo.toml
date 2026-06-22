@@ -19,6 +19,7 @@ pg_test = ["dep:wiremock"]
 [dependencies]
 pgrx = "=0.18.1"
 parquet = { version = "59", features = ["async", "arrow"] }
+regex = "1"
 roaring = "0.11.4"
 arrow = "59"
 azure_core = "1.0"

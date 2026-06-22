@@ -26,6 +26,12 @@ pub use insert::{
     begin_foreign_modify, end_foreign_modify, exec_foreign_insert, plan_foreign_modify,
 };
 
+/// Re-export of the test-only per-group finalize+upload driver. Gated on the
+/// same feature flag as the in-process `FakeBlobStore` so it never appears in
+/// release builds.
+#[cfg(any(test, feature = "pg_test"))]
+pub use insert::finalize_and_upload_for_test;
+
 use pgrx::pg_sys;
 
 /// One entry per (blob, 65_536-row chunk) pair surfaced to the scan/modify

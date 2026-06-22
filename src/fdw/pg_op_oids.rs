@@ -123,6 +123,10 @@ mod tests {
             (1096, "<="),
             (1097, ">"),
             (1098, ">="),
+            // text LIKE (~~) — not in PUSHABLE_OPS; consumed by
+            // pushdown_walk::TEXT_LIKE_OPNO to translate `col LIKE 'pfx%'`
+            // to a range qual. Included here to guard against OID drift.
+            (1209, "~~"),
         ];
         for (oid, name) in expected {
             let oid_val = pg_sys::Oid::from(oid);

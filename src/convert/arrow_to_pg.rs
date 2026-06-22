@@ -154,6 +154,109 @@ pub fn arrow_value_to_datum(
     }
 }
 
+/// Map an Arrow `DataType` to a PG type name suitable for `CREATE FOREIGN
+/// TABLE` DDL emission (SP-2 IMPORT FOREIGN SCHEMA).
+///
+/// Returns an owned `String` uniformly (small allocation; emitted once per
+/// column at IMPORT time) so callers don't have to special-case parameterised
+/// types like `NUMERIC(p, s)`.
+///
+/// Supported types match `arrow_value_to_datum`'s read path so a generated
+/// foreign table can read what its inferred schema describes.
+pub fn arrow_type_to_pg_typename(
+    ty: &arrow::datatypes::DataType,
+) -> crate::error::FdwResult<String> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    Ok(match ty {
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Int16 => "SMALLINT".to_string(),
+        DataType::Int32 => "INTEGER".to_string(),
+        DataType::Int64 => "BIGINT".to_string(),
+        DataType::Float32 => "REAL".to_string(),
+        DataType::Float64 => "DOUBLE PRECISION".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "TEXT".to_string(),
+        DataType::Binary | DataType::LargeBinary => "BYTEA".to_string(),
+        DataType::Date32 => "DATE".to_string(),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => "TIMESTAMP".to_string(),
+        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => "TIMESTAMPTZ".to_string(),
+        DataType::Decimal128(p, s) => format!("NUMERIC({p},{s})"),
+        other => {
+            return Err(crate::error::FdwError::SchemaMismatch(format!(
+                "arrow type {other:?} has no SP-2 DDL mapping"
+            )))
+        }
+    })
+}
+
+/// Parse a raw partition-key string into a PG datum of the declared type.
+///
+/// Used by SP-3b's Hive partition support: one cast per blob (not per row).
+/// Returns `FdwError::SchemaMismatch` on cast failure so the caller can
+/// skip the blob with a NOTICE.
+pub fn parse_text_to_datum(
+    ty: crate::fdw::options::PgPartitionType,
+    raw: &str,
+) -> FdwResult<pg_sys::Datum> {
+    use crate::fdw::options::PgPartitionType;
+
+    match ty {
+        PgPartitionType::Int2 => {
+            let v: i16 = raw
+                .parse()
+                .map_err(|_| FdwError::SchemaMismatch(format!("'{raw}' is not int2")))?;
+            if v < 0 {
+                return Err(FdwError::SchemaMismatch(format!(
+                    "negative partition value '{raw}' not supported in v1"
+                )));
+            }
+            v.into_datum()
+                .ok_or_else(|| FdwError::SchemaMismatch("int2 into_datum returned None".into()))
+        }
+        PgPartitionType::Int4 => {
+            let v: i32 = raw
+                .parse()
+                .map_err(|_| FdwError::SchemaMismatch(format!("'{raw}' is not int4")))?;
+            if v < 0 {
+                return Err(FdwError::SchemaMismatch(format!(
+                    "negative partition value '{raw}' not supported in v1"
+                )));
+            }
+            v.into_datum()
+                .ok_or_else(|| FdwError::SchemaMismatch("int4 into_datum returned None".into()))
+        }
+        PgPartitionType::Int8 => {
+            let v: i64 = raw
+                .parse()
+                .map_err(|_| FdwError::SchemaMismatch(format!("'{raw}' is not int8")))?;
+            if v < 0 {
+                return Err(FdwError::SchemaMismatch(format!(
+                    "negative partition value '{raw}' not supported in v1"
+                )));
+            }
+            v.into_datum()
+                .ok_or_else(|| FdwError::SchemaMismatch("int8 into_datum returned None".into()))
+        }
+        PgPartitionType::Text => raw
+            .to_string()
+            .into_datum()
+            .ok_or_else(|| FdwError::SchemaMismatch("text into_datum returned None".into())),
+        PgPartitionType::Date => {
+            // PG Date = days since 2000-01-01 (PG epoch).
+            let parsed = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                .map_err(|e| FdwError::SchemaMismatch(format!("date '{raw}' parse failed: {e}")))?;
+            let pg_epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+                .ok_or_else(|| FdwError::SchemaMismatch("pg epoch construction failed".into()))?;
+            let days = (parsed - pg_epoch).num_days();
+            let pg_days: i32 = i32::try_from(days)
+                .map_err(|_| FdwError::SchemaMismatch(format!("date '{raw}' out of i32 range")))?;
+            let d = pgrx::datum::Date::try_from(pg_days as pg_sys::DateADT)
+                .map_err(|e| FdwError::SchemaMismatch(format!("date '{raw}' invalid: {e:?}")))?;
+            d.into_datum()
+                .ok_or_else(|| FdwError::SchemaMismatch("date into_datum returned None".into()))
+        }
+    }
+}
+
 /// Safely downcast an Arrow array; returns `SchemaMismatch` on failure.
 fn downcast<T: 'static>(arr: &dyn Array) -> FdwResult<&T> {
     arr.as_any().downcast_ref::<T>().ok_or_else(|| {
@@ -472,5 +575,112 @@ mod tests {
         assert_eq!(super::format_decimal128(-5, 3), "-0.005");
         assert_eq!(super::format_decimal128(7, 0), "7");
         assert_eq!(super::format_decimal128(7, -2), "700");
+    }
+
+    #[pg_test]
+    fn parse_int4_returns_datum() {
+        use crate::fdw::options::PgPartitionType;
+        let d = super::parse_text_to_datum(PgPartitionType::Int4, "2026").unwrap();
+        // Datum bit-pattern for i32(2026) is the integer value itself.
+        assert_eq!(d.value() as i32, 2026);
+    }
+
+    #[pg_test]
+    fn parse_int4_negative_errors() {
+        use crate::fdw::options::PgPartitionType;
+        // SP-3b explicitly rejects negative partition values.
+        assert!(super::parse_text_to_datum(PgPartitionType::Int4, "-1").is_err());
+    }
+
+    #[pg_test]
+    fn parse_int4_non_numeric_errors() {
+        use crate::fdw::options::PgPartitionType;
+        assert!(super::parse_text_to_datum(PgPartitionType::Int4, "abc").is_err());
+    }
+
+    #[pg_test]
+    fn parse_text_returns_datum() {
+        use crate::fdw::options::PgPartitionType;
+        // A text datum is a varlena pointer; assert it's non-null.
+        let d = super::parse_text_to_datum(PgPartitionType::Text, "us-west").unwrap();
+        assert!(d.value() != 0);
+    }
+
+    #[pg_test]
+    fn parse_date_iso_returns_datum() {
+        use crate::fdw::options::PgPartitionType;
+        let _ = super::parse_text_to_datum(PgPartitionType::Date, "2026-06-22").unwrap();
+    }
+
+    #[pg_test]
+    fn parse_date_malformed_errors() {
+        use crate::fdw::options::PgPartitionType;
+        assert!(super::parse_text_to_datum(PgPartitionType::Date, "06/22/2026").is_err());
+    }
+
+    #[test]
+    fn typename_int32_returns_integer() {
+        use arrow::datatypes::DataType;
+        assert_eq!(
+            super::arrow_type_to_pg_typename(&DataType::Int32).unwrap(),
+            "INTEGER"
+        );
+    }
+
+    #[test]
+    fn typename_int64_returns_bigint() {
+        use arrow::datatypes::DataType;
+        assert_eq!(
+            super::arrow_type_to_pg_typename(&DataType::Int64).unwrap(),
+            "BIGINT"
+        );
+    }
+
+    #[test]
+    fn typename_utf8_returns_text() {
+        use arrow::datatypes::DataType;
+        assert_eq!(
+            super::arrow_type_to_pg_typename(&DataType::Utf8).unwrap(),
+            "TEXT"
+        );
+    }
+
+    #[test]
+    fn typename_timestamp_no_tz() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        assert_eq!(
+            super::arrow_type_to_pg_typename(&DataType::Timestamp(TimeUnit::Microsecond, None))
+                .unwrap(),
+            "TIMESTAMP"
+        );
+    }
+
+    #[test]
+    fn typename_timestamp_with_tz() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        assert_eq!(
+            super::arrow_type_to_pg_typename(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into())
+            ))
+            .unwrap(),
+            "TIMESTAMPTZ"
+        );
+    }
+
+    #[test]
+    fn typename_decimal128_returns_numeric() {
+        use arrow::datatypes::DataType;
+        assert_eq!(
+            super::arrow_type_to_pg_typename(&DataType::Decimal128(18, 2)).unwrap(),
+            "NUMERIC(18,2)"
+        );
+    }
+
+    #[test]
+    fn typename_unsupported_errors() {
+        use arrow::datatypes::DataType;
+        let item = std::sync::Arc::new(arrow::datatypes::Field::new("i", DataType::Int32, true));
+        assert!(super::arrow_type_to_pg_typename(&DataType::List(item)).is_err());
     }
 }

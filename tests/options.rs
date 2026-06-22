@@ -239,3 +239,185 @@ fn user_mapping_accepts_azurite_loopback() {
     )])
     .unwrap();
 }
+
+#[test]
+fn parallel_workers_unset_is_none() {
+    let opts = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+    ])
+    .unwrap();
+    assert_eq!(opts.parallel_workers, None);
+}
+
+#[test]
+fn parallel_workers_zero_means_disable() {
+    let opts = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+        ("parallel_workers", "0"),
+    ])
+    .unwrap();
+    assert_eq!(opts.parallel_workers, Some(0));
+}
+
+#[test]
+fn parallel_workers_positive_int() {
+    let opts = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+        ("parallel_workers", "4"),
+    ])
+    .unwrap();
+    assert_eq!(opts.parallel_workers, Some(4));
+}
+
+#[test]
+fn parallel_workers_negative_errors() {
+    let err = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+        ("parallel_workers", "-1"),
+    ])
+    .expect_err("negative parallel_workers must reject");
+    assert!(format!("{err}").contains("parallel_workers"));
+}
+
+#[test]
+fn parallel_workers_non_int_errors() {
+    let err = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+        ("parallel_workers", "abc"),
+    ])
+    .expect_err("non-integer parallel_workers must reject");
+    assert!(format!("{err}").contains("parallel_workers"));
+}
+
+use parquet_azure_fdw::fdw::options::PgPartitionType;
+
+#[test]
+fn partition_unset_is_empty() {
+    let opts = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+    ])
+    .unwrap();
+    assert!(opts.partition_columns.is_empty());
+    assert!(opts.partition_keys.is_empty());
+}
+
+#[test]
+fn partition_basic_parse_two_keys() {
+    let opts = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "events/*.parquet"),
+        ("partition_columns", "year,region"),
+        ("partition_keys", "year:int4,region:text"),
+    ])
+    .unwrap();
+    assert_eq!(
+        opts.partition_columns,
+        vec!["year".to_string(), "region".to_string()]
+    );
+    assert_eq!(
+        opts.partition_keys,
+        vec![
+            ("year".to_string(), PgPartitionType::Int4),
+            ("region".to_string(), PgPartitionType::Text),
+        ]
+    );
+}
+
+#[test]
+fn partition_name_mismatch_errors() {
+    let err = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+        ("partition_columns", "year,region"),
+        ("partition_keys", "year:int4,zone:text"), // 'zone' != 'region'
+    ])
+    .expect_err("name mismatch must reject");
+    assert!(format!("{err}").to_lowercase().contains("partition"));
+}
+
+#[test]
+fn partition_order_mismatch_errors() {
+    let err = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+        ("partition_columns", "year,region"),
+        ("partition_keys", "region:text,year:int4"), // order reversed
+    ])
+    .expect_err("order mismatch must reject");
+    assert!(format!("{err}").to_lowercase().contains("order"));
+}
+
+#[test]
+fn partition_unsupported_type_errors() {
+    let err = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+        ("partition_columns", "ts"),
+        ("partition_keys", "ts:timestamptz"),
+    ])
+    .expect_err("timestamptz not supported");
+    assert!(format!("{err}").to_lowercase().contains("partition"));
+}
+
+#[test]
+fn partition_one_without_other_errors() {
+    let err = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+        ("partition_columns", "year"),
+    ])
+    .expect_err("partition_columns without partition_keys must reject");
+    assert!(format!("{err}").to_lowercase().contains("partition_keys"));
+}
+
+#[test]
+fn sorted_and_files_in_order_unset_defaults() {
+    let opts = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+    ])
+    .unwrap();
+    assert!(opts.sorted.is_empty());
+    assert!(!opts.files_in_order);
+}
+
+#[test]
+fn sorted_basic_parse() {
+    let opts = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+        ("sorted", "ts,id"),
+        ("files_in_order", "true"),
+    ])
+    .unwrap();
+    assert_eq!(opts.sorted, vec!["ts".to_string(), "id".to_string()]);
+    assert!(opts.files_in_order);
+}
+
+#[test]
+fn sorted_without_files_in_order_errors() {
+    let err = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+        ("sorted", "ts"),
+    ])
+    .expect_err("must reject");
+    assert!(format!("{err}").to_lowercase().contains("files_in_order"));
+}
+
+#[test]
+fn files_in_order_without_sorted_errors() {
+    let err = parquet_azure_fdw::fdw::options::parse_table_options_from_slice(&[
+        ("container", "cont"),
+        ("filename", "f.parquet"),
+        ("files_in_order", "true"),
+    ])
+    .expect_err("must reject");
+    assert!(format!("{err}").to_lowercase().contains("sorted"));
+}

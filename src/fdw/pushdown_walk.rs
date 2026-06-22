@@ -86,6 +86,29 @@ unsafe fn walk_node(node: *mut pg_sys::Node) -> Option<PushedExpr> {
     // SAFETY: PG sets `type_` on every Node; reading it is a single u32 load.
     let tag = unsafe { (*node).type_ };
     match tag {
+        pg_sys::NodeTag::T_Var => unsafe {
+            // Bare `Var` of type bool at the top level of a qual list means
+            // `WHERE col` — translate to `col = true`. Non-bool Vars (or
+            // system columns / OUTER/INNER refs with attno < 1) are dropped.
+            // SAFETY: NodeTag dispatch confirmed T_Var; the pointer is a
+            // live `*mut Var` owned by the planner's expression tree.
+            let var = node as *mut pg_sys::Var;
+            if (*var).vartype != pg_sys::BOOLOID {
+                return None;
+            }
+            let attno: i32 = (*var).varattno as i32;
+            if attno < 1 {
+                return None;
+            }
+            // No collation guard: bool has no meaningful collation (varcollid
+            // is typically InvalidOid) and bool comparison is byte-exact.
+            let col = (attno - 1) as usize;
+            Some(PushedExpr::Leaf(PushedQual {
+                col,
+                op: PushedOp::Eq,
+                value: ScalarValueRepr::Bool(true),
+            }))
+        },
         pg_sys::NodeTag::T_OpExpr => unsafe { walk_op_expr(node as *mut pg_sys::OpExpr) },
         pg_sys::NodeTag::T_BoolExpr => unsafe { walk_bool_expr(node as *mut pg_sys::BoolExpr) },
         pg_sys::NodeTag::T_NullTest => unsafe { walk_null_test(node as *mut pg_sys::NullTest) },
@@ -216,6 +239,65 @@ unsafe fn walk_boolean_test(t: *mut pg_sys::BooleanTest) -> Option<PushedExpr> {
     }))
 }
 
+/// PG OID of the `text ~~ text` (LIKE) operator. Stable in `pg_operator` —
+/// drift-guarded by the `(1209, "~~")` entry in
+/// `pg_op_oids::tests::oid_table_matches_pg_catalog`. LIKE isn't in
+/// PUSHABLE_OPS because we translate it to a range qual, not a single op.
+const TEXT_LIKE_OPNO: u32 = 1209;
+
+/// Recognise `'literal_prefix%'` (exactly one `%`, at the end, no `_`,
+/// no `\` escape). Returns `Some(prefix_without_trailing_percent)` if so.
+fn like_prefix_literal(pat: &str) -> Option<String> {
+    if !pat.ends_with('%') {
+        return None;
+    }
+    let prefix = &pat[..pat.len() - 1];
+    if prefix.contains('%') || prefix.contains('_') || prefix.contains('\\') {
+        return None;
+    }
+    if prefix.is_empty() {
+        return None;
+    }
+    Some(prefix.to_string())
+}
+
+/// If `arg` peels to a non-null `T_Const` of TEXT/VARCHAR type, detoast it
+/// and return the owned `String`. Mirrors the `25 | 1043` arm in `try_const`
+/// so the LIKE branch and the general equality branch share one extraction
+/// path.
+///
+/// # Safety
+/// `arg` may be null; if non-null it must be a live PG `Node*` whose
+/// `nodeTag` accurately identifies its concrete type (PG invariant).
+unsafe fn const_text_arg(arg: *mut pg_sys::Node) -> Option<String> {
+    if arg.is_null() {
+        return None;
+    }
+    // SAFETY: caller contract; peel_relabel preserves null-or-live-Node.
+    let node = unsafe { peel_relabel(arg) };
+    if node.is_null() {
+        return None;
+    }
+    // SAFETY: caller contract; nodeTag read.
+    if unsafe { (*node).type_ } != pg_sys::NodeTag::T_Const {
+        return None;
+    }
+    let c = node as *mut pg_sys::Const;
+    // SAFETY: confirmed T_Const above.
+    let (isnull, ty, datum) = unsafe { ((*c).constisnull, (*c).consttype, (*c).constvalue) };
+    if isnull {
+        return None;
+    }
+    match ty.to_u32() {
+        25 | 1043 => {
+            // SAFETY: a non-null TEXTOID/VARCHAROID Const carries a live
+            // `varlena*` payload; helper handles detoast + pfree.
+            unsafe { text_datum_to_string(datum.cast_mut_ptr::<pg_sys::varlena>()) }
+        }
+        _ => None,
+    }
+}
+
 /// Translate `Var op Const` (or `Const op Var` — flipped).
 ///
 /// # Safety
@@ -223,6 +305,48 @@ unsafe fn walk_boolean_test(t: *mut pg_sys::BooleanTest) -> Option<PushedExpr> {
 unsafe fn walk_op_expr(expr: *mut pg_sys::OpExpr) -> Option<PushedExpr> {
     // SAFETY: expr is a live OpExpr (caller contract via nodeTag).
     let (opno, args) = unsafe { ((*expr).opno, (*expr).args) };
+
+    // LIKE-as-range: handle `text ~~ 'prefix%'` before the lookup_op gate —
+    // `~~` is intentionally NOT in PUSHABLE_OPS (we translate it to a range
+    // pair, not a single op).
+    if opno.to_u32() == TEXT_LIKE_OPNO {
+        if args.is_null() {
+            return None;
+        }
+        // SAFETY: args is a live List* of Expr* per OpExpr layout.
+        if unsafe { pg_sys::list_length(args) } != 2 {
+            return None;
+        }
+        // SAFETY: list has length 2; indices in bounds.
+        let lhs = unsafe { pg_sys::list_nth(args, 0) as *mut pg_sys::Node };
+        // SAFETY: same.
+        let rhs = unsafe { pg_sys::list_nth(args, 1) as *mut pg_sys::Node };
+        // PG always lowers `col LIKE 'pat'` to `(Var ~~ Const)`. We require
+        // Var on the left, Utf8 Const on the right.
+        let col = unsafe { try_var(lhs) }?;
+        // Collation guard: same reasoning as in equality — non-default,
+        // non-C collations may diverge from arrow byte-wise comparison.
+        // SAFETY: try_var succeeded above, so peeled lhs is a live T_Var.
+        if !unsafe { var_collation_ok(lhs) } {
+            return None;
+        }
+        let pattern: String = unsafe { const_text_arg(rhs) }?;
+        let prefix = like_prefix_literal(&pattern)?;
+        let upper = crate::fdw::pushdown::next_lex_upper(&prefix)?;
+        return Some(PushedExpr::And(vec![
+            PushedExpr::Leaf(PushedQual {
+                col,
+                op: PushedOp::Ge,
+                value: ScalarValueRepr::Utf8(prefix),
+            }),
+            PushedExpr::Leaf(PushedQual {
+                col,
+                op: PushedOp::Lt,
+                value: ScalarValueRepr::Utf8(upper),
+            }),
+        ]));
+    }
+
     let (pop, _lhs_ty, _rhs_ty) = lookup_op(opno)?;
     if args.is_null() {
         return None;
@@ -237,6 +361,16 @@ unsafe fn walk_op_expr(expr: *mut pg_sys::OpExpr) -> Option<PushedExpr> {
     let rhs = unsafe { pg_sys::list_nth(args, 1) as *mut pg_sys::Node };
     // Try Var op Const, then Const op Var (flip op).
     if let (Some(col), Some(val)) = (unsafe { try_var(lhs) }, unsafe { try_const(rhs) }) {
+        // Collation guard: only push quals on default-collation or binary (C)
+        // collation Vars. Other collations (e.g. "tr_TR") may diverge from
+        // arrow byte-comparison semantics; sound default is to drop the qual
+        // (PG re-evaluates above the scan). No Rust-level unit test: PG
+        // collation OIDs are runtime constants not constructable in tests/*.rs
+        // without spinning up Postgres — soundness corpus (Task 5) covers it.
+        // SAFETY: try_var above succeeded, so the peeled lhs is a live T_Var.
+        if !unsafe { var_collation_ok(lhs) } {
+            return None;
+        }
         return Some(PushedExpr::Leaf(PushedQual {
             col,
             op: pop,
@@ -244,6 +378,10 @@ unsafe fn walk_op_expr(expr: *mut pg_sys::OpExpr) -> Option<PushedExpr> {
         }));
     }
     if let (Some(val), Some(col)) = (unsafe { try_const(lhs) }, unsafe { try_var(rhs) }) {
+        // SAFETY: try_var above succeeded, so the peeled rhs is a live T_Var.
+        if !unsafe { var_collation_ok(rhs) } {
+            return None;
+        }
         let flipped = match pop {
             PushedOp::Lt => PushedOp::Gt,
             PushedOp::Gt => PushedOp::Lt,
@@ -258,6 +396,32 @@ unsafe fn walk_op_expr(expr: *mut pg_sys::OpExpr) -> Option<PushedExpr> {
         }));
     }
     None
+}
+
+/// Return `true` iff `node` peels to a `Var` whose `varcollid` is
+/// `DEFAULT_COLLATION_OID` or `C_COLLATION_OID`. Any other collation is
+/// rejected as collation-unsafe to push down.
+///
+/// # Safety
+/// `node` must satisfy the same contract as [`try_var`]: non-null and
+/// nodeTag-valid (or null, in which case this returns false).
+unsafe fn var_collation_ok(node: *mut pg_sys::Node) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    // SAFETY: caller contract; peel_relabel preserves null-or-live-Node.
+    let node = unsafe { peel_relabel(node) };
+    if node.is_null() {
+        return false;
+    }
+    // SAFETY: caller contract — nodeTag is a single u32 load.
+    if unsafe { (*node).type_ } != pg_sys::NodeTag::T_Var {
+        return false;
+    }
+    let v = node as *mut pg_sys::Var;
+    // SAFETY: confirmed T_Var above; `varcollid` is in-layout.
+    let coll = unsafe { (*v).varcollid };
+    coll == pg_sys::DEFAULT_COLLATION_OID || coll == pg_sys::C_COLLATION_OID
 }
 
 /// If `node` is a Var (and not a system column), return its 0-based attno.
@@ -327,12 +491,11 @@ unsafe fn try_const(node: *mut pg_sys::Node) -> Option<ScalarValueRepr> {
         // SAFETY: confirmed T_Const non-null with FLOAT8OID.
         701 => ScalarValueRepr::F64(unsafe { pg_sys::DatumGetFloat8(datum) }),
         25 | 1043 => {
-            // text / varchar. Detoast then convert to a Rust String.
-            // SAFETY: a non-null TEXTOID/VARCHAROID Const carries a live
-            // `varlena*` payload; helper handles detoast + pfree of intermediates.
-            ScalarValueRepr::Utf8(unsafe {
-                text_datum_to_string(datum.cast_mut_ptr::<pg_sys::varlena>())
-            }?)
+            // text / varchar. Detoast then convert to a Rust String. Share
+            // the extraction with the LIKE branch via `const_text_arg` so
+            // there's exactly one Utf8-Const path in the walker.
+            // SAFETY: caller contract: `node` is a live PG `Node*`.
+            ScalarValueRepr::Utf8(unsafe { const_text_arg(node) }?)
         }
         // PG date is days-since-2000-01-01; Arrow Date32 is days-since-UNIX-epoch.
         1082 => {
@@ -603,5 +766,30 @@ mod tests {
         // SAFETY: explicit null is the contract-allowed input.
         let out = unsafe { peel_relabel(core::ptr::null_mut()) };
         assert!(out.is_null());
+    }
+
+    #[test]
+    fn like_prefix_literal_accepts_simple_prefix() {
+        assert_eq!(like_prefix_literal("al%"), Some("al".into()));
+    }
+    #[test]
+    fn like_prefix_literal_rejects_middle_wildcard() {
+        assert!(like_prefix_literal("a%b").is_none());
+    }
+    #[test]
+    fn like_prefix_literal_rejects_suffix_wildcard() {
+        assert!(like_prefix_literal("%al").is_none());
+    }
+    #[test]
+    fn like_prefix_literal_rejects_underscore() {
+        assert!(like_prefix_literal("a_b%").is_none());
+    }
+    #[test]
+    fn like_prefix_literal_rejects_backslash_escape() {
+        assert!(like_prefix_literal("a\\%%").is_none());
+    }
+    #[test]
+    fn like_prefix_literal_rejects_empty_prefix() {
+        assert!(like_prefix_literal("%").is_none());
     }
 }

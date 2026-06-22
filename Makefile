@@ -25,7 +25,7 @@ FEATURES_TEST  = $(PG),pg_test
 CARGO_LIB      = cargo build --no-default-features --features $(FEATURES_LIB)
 CARGO_CLIPPY   = cargo clippy --no-default-features --all-targets --features $(FEATURES_TEST) -- -D warnings
 CARGO_CHECK    = cargo check  --no-default-features --features $(FEATURES_LIB)
-CARGO_PGRX     = cargo pgrx test $(PG)
+CARGO_PGRX     = cargo pgrx test --no-default-features --features $(FEATURES_TEST) $(PG)
 
 # Default target
 help:
@@ -105,7 +105,7 @@ test-all:
 	@for pg in $(VERSIONS); do \
 		echo "=== pgrx test $$pg ==="; \
 		$(MAKE) stop-pg PG=$$pg; \
-		cargo pgrx test $$pg || exit 1; \
+		cargo pgrx test --no-default-features --features $$pg,pg_test $$pg || exit 1; \
 	done
 	@echo "=== all PG versions pass ==="
 
@@ -116,10 +116,10 @@ test-live:
 	@if [ -f "$(ENV_FILE)" ]; then \
 		echo "Sourcing $(ENV_FILE)"; \
 		set -a; . ./$(ENV_FILE); set +a; \
-		cargo pgrx test $(PG) -- live_smoke; \
+		cargo pgrx test --no-default-features --features $(FEATURES_TEST) $(PG) -- live_smoke; \
 	else \
 		echo "$(ENV_FILE) not found — running with inherited env"; \
-		cargo pgrx test $(PG) -- live_smoke; \
+		cargo pgrx test --no-default-features --features $(FEATURES_TEST) $(PG) -- live_smoke; \
 	fi
 
 test-live-pg14:

@@ -567,3 +567,84 @@ fn scan_handoff_to_commit_plan_lost_update_guard() {
         "etag must still be the concurrent writer's"
     );
 }
+
+#[test]
+fn update_preserves_source_compression() {
+    let fake = FakeBlobStore::start_blocking();
+    let container = "c-update-preserve-compression";
+    let client = make_client(&fake, container);
+
+    // Seed the source blob with GZIP — NOT the default snappy. The plan
+    // below specifies snappy; the fix must read the source codec from the
+    // parquet footer and use THAT instead.
+    let schema = schema_two_cols();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])) as ArrayRef,
+        ],
+    )
+    .expect("build record batch fixture");
+    let mut w = ParquetBatchWriter::new(schema.clone(), Compression::Gzip)
+        .expect("construct gzip ParquetBatchWriter");
+    w.write(&batch).expect("write fixture batch");
+    let body = w.finish().expect("finalise gzip fixture parquet");
+    let etag = fake.put_blob(container, "x.parquet", body);
+
+    let blob_table = vec![BlobIdEntry {
+        name: "x.parquet".into(),
+        chunk_base_row: 0,
+        etag,
+    }];
+    let mut edits = HashMap::new();
+    let mut be = BlobEdits::default();
+    be.updates.insert(
+        1,
+        RowOverride {
+            values: vec![
+                None,
+                Some(Arc::new(StringArray::from(vec!["NEW"])) as ArrayRef),
+            ],
+        },
+    );
+    edits.insert(0u32, be);
+
+    let plan = ModifyPlan {
+        blob_table,
+        edits,
+        schema: schema_two_cols(),
+        pg_oids: vec![],
+        update_attnums: vec![1],
+        client,
+        // Plan says snappy; commit_plan must IGNORE this in favour of the
+        // source blob's gzip codec.
+        compression: Compression::Snappy,
+        is_delete: false,
+        ctid_attno: 0,
+        edit_count: 0,
+    };
+    commit_plan(plan).expect("commit_plan");
+
+    let body = fake
+        .get_blob(container, "x.parquet")
+        .expect("blob still present");
+
+    // Verify the rewritten blob still uses gzip.
+    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+    let codec = rt().block_on(async {
+        let cursor = std::io::Cursor::new(body.clone());
+        let builder = ParquetRecordBatchStreamBuilder::new(cursor)
+            .await
+            .expect("build stream over rewritten parquet bytes");
+        builder.metadata().row_group(0).column(0).compression()
+    });
+    assert!(
+        matches!(codec, parquet::basic::Compression::GZIP(_)),
+        "expected GZIP, got {codec:?}"
+    );
+
+    // Sanity: row contents still got rewritten correctly.
+    let actual = read_back(body);
+    assert_eq!(actual, vec!["a", "NEW", "c", "d"]);
+}

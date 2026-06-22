@@ -129,3 +129,68 @@ fn update_and_delete_combined_with_string_col() {
     assert_eq!(s.value(0), "b");
     assert_eq!(s.value(1), "zzz");
 }
+
+#[test]
+fn streaming_multi_batch_deletes_and_updates_straddle_boundaries() {
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet_azure_fdw::fdw::modify::kernel::{apply_edits, BlobEdits, RowOverride};
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let mk = |ids: &[i64], names: &[&str]| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+                Arc::new(StringArray::from(names.to_vec())) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+    // Absolute rows: 0,1,2 | 3,4,5 | 6,7,8
+    let input = vec![
+        mk(&[0, 1, 2], &["a", "b", "c"]),
+        mk(&[3, 4, 5], &["d", "e", "f"]),
+        mk(&[6, 7, 8], &["g", "h", "i"]),
+    ];
+    let mut edits = BlobEdits::default();
+    edits.deletes.insert(1); // batch 0
+    edits.deletes.insert(5); // batch 1
+    edits.deletes.insert(6); // batch 2 (first row)
+    edits.updates.insert(
+        4, // batch 1, local 1 — override name
+        RowOverride {
+            values: vec![
+                None,
+                Some(Arc::new(StringArray::from(vec!["E"])) as ArrayRef),
+            ],
+        },
+    );
+    edits.updates.insert(
+        8, // batch 2, local 2 — override id
+        RowOverride {
+            values: vec![Some(Arc::new(Int64Array::from(vec![88])) as ArrayRef), None],
+        },
+    );
+
+    let out = apply_edits(input, schema.clone(), &edits).unwrap();
+    // Flatten output for assertion.
+    let mut got_ids = Vec::new();
+    let mut got_names = Vec::new();
+    for b in &out {
+        let ic = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let nc = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        for i in 0..b.num_rows() {
+            got_ids.push(ic.value(i));
+            got_names.push(nc.value(i).to_string());
+        }
+    }
+    // Deleted: 1, 5, 6. Updated: row4 name→E, row8 id→88.
+    // Surviving absolute rows: 0,2,3,4,7,8.
+    assert_eq!(got_ids, vec![0, 2, 3, 4, 7, 88]);
+    assert_eq!(got_names, vec!["a", "c", "d", "E", "h", "i"]);
+}
