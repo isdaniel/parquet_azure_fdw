@@ -35,9 +35,33 @@ pub unsafe fn datum_to_partition_string(
     // to the signed primitive width matches the static-inline `DatumGet*`
     // helpers PG inlines on every supported version.
     match oid {
-        x if x == pg_sys::INT2OID => Ok((datum.value() as i16).to_string()),
-        x if x == pg_sys::INT4OID => Ok((datum.value() as i32).to_string()),
-        x if x == pg_sys::INT8OID => Ok((datum.value() as i64).to_string()),
+        x if x == pg_sys::INT2OID => {
+            let v = datum.value() as i16;
+            if v < 0 {
+                return Err(FdwError::SchemaMismatch(
+                    "negative partition value not supported in v1".into(),
+                ));
+            }
+            Ok(v.to_string())
+        }
+        x if x == pg_sys::INT4OID => {
+            let v = datum.value() as i32;
+            if v < 0 {
+                return Err(FdwError::SchemaMismatch(
+                    "negative partition value not supported in v1".into(),
+                ));
+            }
+            Ok(v.to_string())
+        }
+        x if x == pg_sys::INT8OID => {
+            let v = datum.value() as i64;
+            if v < 0 {
+                return Err(FdwError::SchemaMismatch(
+                    "negative partition value not supported in v1".into(),
+                ));
+            }
+            Ok(v.to_string())
+        }
         x if x == pg_sys::DATEOID => {
             // PG DateADT is i32 days since 2000-01-01 (PG epoch). Render as
             // YYYY-MM-DD so the path round-trips with

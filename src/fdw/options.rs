@@ -415,7 +415,7 @@ pub fn parse_table_options_from_slice(kv: &[(&str, &str)]) -> FdwResult<TableOpt
                 )));
             }
             for (i, (col, (kname, _))) in cols.iter().zip(keys.iter()).enumerate() {
-                if col != kname {
+                if !col.eq_ignore_ascii_case(kname) {
                     return Err(FdwError::InvalidOption(format!(
                         "partition_columns/partition_keys disagree at index {i}: \
                          '{col}' vs '{kname}' (must be same name in same order)"

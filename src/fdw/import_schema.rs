@@ -229,7 +229,15 @@ unsafe fn do_import(
     // List under the remote_schema prefix.
     let listed: Vec<(String, String)> =
         runtime::block_on(client.list_with_prefix_etags(&remote_schema))?;
-    let blob_names: Vec<String> = listed.into_iter().map(|(n, _)| n).collect();
+    // Only parquet files: the generated tables are `filename '.../*.parquet'`,
+    // and sampling a sidecar (`_SUCCESS`, `_common_metadata`, `.DS_Store`, …)
+    // that sorts before the first `.parquet` would fail inference and skip the
+    // whole directory.
+    let blob_names: Vec<String> = listed
+        .into_iter()
+        .map(|(n, _)| n)
+        .filter(|n| n.to_ascii_lowercase().ends_with(".parquet"))
+        .collect();
     let groups = group_blobs_by_directory(&blob_names, &container);
 
     // Apply LIMIT TO / EXCEPT.
@@ -296,6 +304,11 @@ pub fn infer_columns(client: &AzureBlobClient, name: &str) -> FdwResult<Vec<(Str
     for f in arrow_schema.fields() {
         let ty = arrow_type_to_pg_typename(f.data_type())?;
         cols.push((f.name().clone(), ty));
+    }
+    if cols.is_empty() {
+        return Err(FdwError::SchemaMismatch(format!(
+            "Parquet file '{name}' has no columns, cannot import"
+        )));
     }
     Ok(cols)
 }

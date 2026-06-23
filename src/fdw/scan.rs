@@ -1165,28 +1165,20 @@ pub(crate) unsafe fn build_state(
     // rescan) can call it — the merge stream is single-pass, so a rescan MUST
     // rebuild it from scratch (see C1 in `re_scan_foreign_scan`).
     //
-    // SP-3c C1: sorted mode forces a FULL identity projection because the
-    // merge stream yields batches carrying ALL parquet columns in parquet
-    // order, and `iterate_foreign_scan` indexes `batch.column(arrow_col)` by
-    // `attno_map` position. Partitioned tables are rejected inside the helper,
-    // so `natts == parquet column count` and identity is the correct map.
-    // Known v1 limitation: sorted mode disables projection pushdown (reads
-    // all columns).
-    // SP-4 review fix: the forced-identity projection is itself a sorted-mode
-    // side effect, so it must be gated on the same GUC as
-    // `build_sorted_stream_if_active`. Otherwise a partitioned+sorted table
-    // with enable_multifile=off would force identity projection over `natts`
-    // (incl. partition cols) while the sequential path opens only
-    // `parquet_col_count < natts` columns → `batch.column(arrow_col)` panic.
-    let sorted_active = crate::ENABLE_MULTIFILE.get() && !core.table_opts.sorted.is_empty();
-    if sorted_active {
-        let natts = core.pg_oids.len();
-        let identity: Vec<usize> = (0..natts).collect();
-        core.projection = Some(identity.clone());
-        core.attno_map = identity;
-    }
+    // SP-3c C1: when sorted mode is ACTIVE the merge stream yields batches
+    // carrying ALL parquet columns in parquet order, and `iterate_foreign_scan`
+    // indexes `batch.column(arrow_col)` by `attno_map`, so we force a full
+    // identity projection — but ONLY when the stream was actually built.
+    // `build_sorted_stream_if_active` returns None unless the GUC is on, the
+    // table is sorted, AND the command is SELECT (sorted mode skips synthetic
+    // ctid stamping, which UPDATE/DELETE rely on). Gating the projection on
+    // `sorted_stream.is_some()` keeps it exactly in step with the stream: a
+    // modify scan — or a partitioned+sorted table with enable_multifile=off —
+    // keeps its real projection/attno_map and the sequential ctid-stamping path.
+    // Known v1 limitation: sorted mode disables projection pushdown (reads all
+    // columns).
     // SAFETY: `node` is the live ForeignScanState; the helper only reads its
-    // currentRelation TupleDesc (via `resolve_attno_by_name`).
+    // currentRelation TupleDesc (via `resolve_attno_by_name`) and command type.
     let sorted_stream = unsafe {
         build_sorted_stream_if_active(
             node,
@@ -1198,6 +1190,12 @@ pub(crate) unsafe fn build_state(
             &core.pg_oids,
         )?
     };
+    if sorted_stream.is_some() {
+        let natts = core.pg_oids.len();
+        let identity: Vec<usize> = (0..natts).collect();
+        core.projection = Some(identity.clone());
+        core.attno_map = identity;
+    }
 
     let mut state = assemble_scan_state(core, producer);
     state.sorted_stream = sorted_stream;
@@ -1242,6 +1240,22 @@ unsafe fn build_sorted_stream_if_active(
         return Ok(None);
     }
     if table_opts.sorted.is_empty() {
+        return Ok(None);
+    }
+    // Sorted merge is SELECT-only: `iterate_foreign_scan` deliberately skips
+    // synthetic ctid stamping in sorted mode, which UPDATE/DELETE rely on to
+    // identify rows. For any non-SELECT command, return None so the sequential
+    // per-blob path (which stamps ctids) runs instead. This is the single gate
+    // covering both call sites (`build_state` and `re_scan_foreign_scan`).
+    // SAFETY: `node` is the live ForeignScanState; `ss.ps.state` and its
+    // `es_plannedstmt` are populated for the duration of execution.
+    let is_select = unsafe {
+        let estate = (*node).ss.ps.state;
+        !estate.is_null()
+            && !(*estate).es_plannedstmt.is_null()
+            && (*(*estate).es_plannedstmt).commandType == pg_sys::CmdType::CMD_SELECT
+    };
+    if !is_select {
         return Ok(None);
     }
     let _ = pg_oids; // kept in the signature for symmetry with the caller's
@@ -1316,39 +1330,57 @@ unsafe fn build_sorted_stream_if_active(
     // `Equal` is not `<`. We therefore read each builder's arrow schema
     // BEFORE `.build()` and require every blob to agree on the arrow
     // `DataType` of each sort column.
-    let mut first_sort_types: Option<Vec<arrow::datatypes::DataType>> = None;
-    for (blob, _etag) in blobs {
-        let reader = client.open_blob(blob);
-        let stream = runtime::block_on(async {
-            let b = ParquetRecordBatchStreamBuilder::new(reader).await?;
-            let schema = b.schema().clone();
-            let mut this_types = Vec::with_capacity(sort_col_indices.len());
-            for &col_idx in &sort_col_indices {
-                if col_idx >= schema.fields().len() {
-                    return Err(FdwError::SchemaMismatch(format!(
-                        "sort column index {col_idx} out of range for blob '{blob}' (parquet has {} columns)",
-                        schema.fields().len()
-                    )));
+    // Open the blob streams concurrently but with a BOUNDED fan-out. Sequential
+    // `block_on`s would mean K serial Azure round-trips at scan init; opening
+    // all K (≤256) at once risks socket exhaustion / Azure throttling. A
+    // `buffered(16)` stream caps in-flight opens at 16 while still overlapping
+    // the IO. `buffered` preserves input order, so `streams`/`names` stay
+    // aligned with `blobs`.
+    use futures::stream::StreamExt as _;
+    const OPEN_CONCURRENCY: usize = 16;
+    let opened = runtime::block_on(
+        futures::stream::iter(blobs.iter().map(|(blob, _etag)| {
+            let reader = client.open_blob(blob);
+            let sort_col_indices = &sort_col_indices;
+            async move {
+                let b = ParquetRecordBatchStreamBuilder::new(reader).await?;
+                let schema = b.schema().clone();
+                let mut this_types = Vec::with_capacity(sort_col_indices.len());
+                for &col_idx in sort_col_indices {
+                    if col_idx >= schema.fields().len() {
+                        return Err(FdwError::SchemaMismatch(format!(
+                            "sort column index {col_idx} out of range for blob '{blob}' (parquet has {} columns)",
+                            schema.fields().len()
+                        )));
+                    }
+                    this_types.push(schema.field(col_idx).data_type().clone());
                 }
-                this_types.push(schema.field(col_idx).data_type().clone());
+                FdwResult::Ok((blob.clone(), this_types, b.build()?))
             }
-            match &first_sort_types {
-                None => first_sort_types = Some(this_types),
-                Some(first) => {
-                    for (k, &col_idx) in sort_col_indices.iter().enumerate() {
-                        if this_types[k] != first[k] {
-                            return Err(FdwError::SchemaMismatch(format!(
-                                "blob '{blob}' disagrees on the type of sort column at parquet index {col_idx}: {:?} vs {:?} — all merged blobs must share the same physical type",
-                                this_types[k], first[k]
-                            )));
-                        }
+        }))
+        .buffered(OPEN_CONCURRENCY)
+        .collect::<Vec<_>>(),
+    );
+    // Process in blob order: first blob's sort-column types win, every other
+    // blob must agree (same-type guard, see above).
+    let mut first_sort_types: Option<Vec<arrow::datatypes::DataType>> = None;
+    for res in opened {
+        let (blob, this_types, stream) = res?;
+        match &first_sort_types {
+            None => first_sort_types = Some(this_types),
+            Some(first) => {
+                for (k, &col_idx) in sort_col_indices.iter().enumerate() {
+                    if this_types[k] != first[k] {
+                        return Err(FdwError::SchemaMismatch(format!(
+                            "blob '{blob}' disagrees on the type of sort column at parquet index {col_idx}: {:?} vs {:?} — all merged blobs must share the same physical type",
+                            this_types[k], first[k]
+                        )));
                     }
                 }
             }
-            FdwResult::Ok(b.build()?)
-        })?;
+        }
         streams.push(stream);
-        names.push(blob.clone());
+        names.push(blob);
     }
     Ok(Some(runtime::block_on(
         crate::parquet_io::multifile::MultiFileSortedStream::new(streams, names, sort_col_indices),

@@ -421,7 +421,12 @@ unsafe fn var_collation_ok(node: *mut pg_sys::Node) -> bool {
     let v = node as *mut pg_sys::Var;
     // SAFETY: confirmed T_Var above; `varcollid` is in-layout.
     let coll = unsafe { (*v).varcollid };
-    coll == pg_sys::DEFAULT_COLLATION_OID || coll == pg_sys::C_COLLATION_OID
+    // Non-collation-bearing types (int/float/bool/date/timestamp) carry
+    // `InvalidOid` here — always safe to push. Only collation-bearing (text)
+    // Vars with a non-default, non-C collation are dropped.
+    coll == pg_sys::DEFAULT_COLLATION_OID
+        || coll == pg_sys::C_COLLATION_OID
+        || coll == pg_sys::InvalidOid
 }
 
 /// If `node` is a Var (and not a system column), return its 0-based attno.

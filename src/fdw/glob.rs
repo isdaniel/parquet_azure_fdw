@@ -53,14 +53,15 @@ pub fn parse_glob(pattern: &str) -> FdwResult<GlobPattern> {
         match c {
             '*' => re_src.push_str("[^/]*"),
             '?' => re_src.push_str("[^/]"),
-            c if c.is_ascii_alphanumeric() => re_src.push(c),
-            // Escape every other character to keep the regex literal-safe.
-            c => {
+            // Escape only real regex metacharacters. The old "escape everything
+            // not ASCII-alphanumeric" rule produced `\ä`-style escapes for
+            // Unicode chars, which the regex crate rejects — breaking any glob
+            // containing non-ASCII alphanumerics.
+            '.' | '+' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
                 re_src.push('\\');
-                for esc_c in c.to_string().chars() {
-                    re_src.push(esc_c);
-                }
+                re_src.push(c);
             }
+            _ => re_src.push(c),
         }
     }
     re_src.push('$');
@@ -92,6 +93,20 @@ mod tests {
         assert!(g.regex.is_match("logs/2026/access.log"));
         assert!(!g.regex.is_match("logs/2026/sub/access.log"));
         assert!(!g.regex.is_match("logs/access.log"));
+    }
+
+    #[test]
+    fn unicode_chars_compile_and_match() {
+        // Regression: non-ASCII alphanumerics must not be backslash-escaped
+        // (the regex crate rejects `\ä`-style escapes). The glob must compile
+        // and match literally.
+        let g = parse_glob("数据/*.parquet").unwrap();
+        assert!(g.regex.is_match("数据/2026.parquet"));
+        assert!(!g.regex.is_match("other/2026.parquet"));
+        // A real metacharacter is still escaped (treated literally, not regex).
+        let g2 = parse_glob("a.b/*.parquet").unwrap();
+        assert!(g2.regex.is_match("a.b/x.parquet"));
+        assert!(!g2.regex.is_match("axb/x.parquet"));
     }
 
     #[test]

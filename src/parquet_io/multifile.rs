@@ -11,7 +11,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
 /// Sort-key value with NULLS LAST semantics.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum SortKeyValue {
     Null,
     I64(i64),
@@ -21,25 +21,43 @@ pub enum SortKeyValue {
     TimestampMicros(i64),
 }
 
+impl PartialEq for SortKeyValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
 impl Eq for SortKeyValue {}
 
 impl Ord for SortKeyValue {
     fn cmp(&self, other: &Self) -> Ordering {
-        // NULLS LAST: Null is greater than any non-null.
-        match (self, other) {
-            (SortKeyValue::Null, SortKeyValue::Null) => Ordering::Equal,
-            (SortKeyValue::Null, _) => Ordering::Greater,
-            (_, SortKeyValue::Null) => Ordering::Less,
-            (SortKeyValue::I64(a), SortKeyValue::I64(b)) => a.cmp(b),
-            (SortKeyValue::F64(a), SortKeyValue::F64(b)) => {
-                a.partial_cmp(b).unwrap_or(Ordering::Equal)
+        // Total order with NULLS LAST. Ordering by variant discriminant first
+        // keeps the order total even for mixed-variant comparisons (unreachable
+        // at runtime — the scan enforces schema agreement — but a malformed
+        // call must never violate the heap invariant). F64 uses `total_cmp` so
+        // NaN is ordered consistently with `Eq` (derived `partial_cmp` would
+        // return `None` → silently `Equal`, contradicting `eq`).
+        fn discriminant(v: &SortKeyValue) -> u8 {
+            match v {
+                SortKeyValue::I64(_) => 0,
+                SortKeyValue::F64(_) => 1,
+                SortKeyValue::Utf8(_) => 2,
+                SortKeyValue::Date32(_) => 3,
+                SortKeyValue::TimestampMicros(_) => 4,
+                SortKeyValue::Null => 5, // NULLS LAST: greatest discriminant
             }
-            (SortKeyValue::Utf8(a), SortKeyValue::Utf8(b)) => a.cmp(b),
-            (SortKeyValue::Date32(a), SortKeyValue::Date32(b)) => a.cmp(b),
-            (SortKeyValue::TimestampMicros(a), SortKeyValue::TimestampMicros(b)) => a.cmp(b),
-            // Mixed-type comparison: treat as Equal to keep heap monotonic
-            // (caller must enforce schema agreement).
-            _ => Ordering::Equal,
+        }
+        match discriminant(self).cmp(&discriminant(other)) {
+            Ordering::Equal => match (self, other) {
+                (SortKeyValue::I64(a), SortKeyValue::I64(b)) => a.cmp(b),
+                (SortKeyValue::F64(a), SortKeyValue::F64(b)) => a.total_cmp(b),
+                (SortKeyValue::Utf8(a), SortKeyValue::Utf8(b)) => a.cmp(b),
+                (SortKeyValue::Date32(a), SortKeyValue::Date32(b)) => a.cmp(b),
+                (SortKeyValue::TimestampMicros(a), SortKeyValue::TimestampMicros(b)) => a.cmp(b),
+                (SortKeyValue::Null, SortKeyValue::Null) => Ordering::Equal,
+                _ => unreachable!("equal discriminants imply the same variant"),
+            },
+            ord => ord,
         }
     }
 }
@@ -91,6 +109,13 @@ pub fn extract_sort_key(col: &dyn Array, row: usize) -> FdwResult<SortKeyValue> 
         DataType::Utf8 => SortKeyValue::Utf8(
             col.as_any()
                 .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::LargeUtf8 => SortKeyValue::Utf8(
+            col.as_any()
+                .downcast_ref::<LargeStringArray>()
                 .unwrap()
                 .value(row)
                 .to_string(),
@@ -182,20 +207,28 @@ where
         let mut wrapped_streams: Vec<Option<ParquetRecordBatchStream<R>>> =
             Vec::with_capacity(streams.len());
         for (i, stream) in streams.iter_mut().enumerate() {
-            // Pull first batch from this stream.
-            match stream.next().await {
-                Some(Ok(batch)) if batch.num_rows() > 0 => {
-                    let key = build_key(&batch, 0, &sort_col_indices)?;
-                    heap.push(Reverse(HeapEntry {
-                        key,
-                        source_idx: i,
-                        batch,
-                        row_in_batch: 0,
-                    }));
+            // Pull the first NON-EMPTY batch. An empty leading batch must not
+            // drop the stream from the heap — the heap is the only thing that
+            // re-polls it, so any later non-empty batches would be silently
+            // lost. Mirrors the refill loop in `next_row`.
+            loop {
+                match stream.next().await {
+                    Some(Ok(batch)) => {
+                        if batch.num_rows() > 0 {
+                            let key = build_key(&batch, 0, &sort_col_indices)?;
+                            heap.push(Reverse(HeapEntry {
+                                key,
+                                source_idx: i,
+                                batch,
+                                row_in_batch: 0,
+                            }));
+                            break;
+                        }
+                        // Empty batch — keep pulling.
+                    }
+                    Some(Err(e)) => return Err(FdwError::from(e)),
+                    None => break, // empty/exhausted blob — leave it out of the heap
                 }
-                Some(Ok(_)) => { /* empty first batch — leave it out of the heap */ }
-                Some(Err(e)) => return Err(FdwError::from(e)),
-                None => { /* empty blob — leave it out of the heap */ }
             }
         }
         // Move the streams into our owned Vec.
@@ -335,6 +368,16 @@ mod tests {
     fn sort_key_ordering_within_type() {
         assert!(SortKeyValue::I64(1) < SortKeyValue::I64(2));
         assert!(SortKeyValue::Utf8("a".into()) < SortKeyValue::Utf8("b".into()));
+    }
+
+    #[test]
+    fn sort_key_ord_eq_consistent_for_nan() {
+        // Regression: Ord must agree with Eq. Derived PartialEq + partial_cmp
+        // made NaN != NaN while cmp returned Equal — a heap-invariant violation.
+        // total_cmp makes NaN order consistently and equal to itself here.
+        let nan = SortKeyValue::F64(f64::NAN);
+        assert_eq!(nan.cmp(&nan), Ordering::Equal);
+        assert!(nan == nan);
     }
 
     #[tokio::test(flavor = "current_thread")]

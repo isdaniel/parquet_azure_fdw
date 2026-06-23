@@ -142,6 +142,7 @@ pub fn is_pushable(op: &str, ty: &DataType) -> bool {
         | DataType::Float32
         | DataType::Float64
         | DataType::Utf8
+        | DataType::LargeUtf8
         | DataType::Date32 => true,
         DataType::Timestamp(_, tz) => tz.is_none(),
         DataType::Decimal128(_, scale) => *scale <= 18 && *scale >= 0,
@@ -270,7 +271,7 @@ fn eval_leaf(
     }
 }
 
-fn scalar_to_array(v: &ScalarValueRepr, _ty: &DataType) -> Result<ArrayRef, ArrowError> {
+fn scalar_to_array(v: &ScalarValueRepr, ty: &DataType) -> Result<ArrayRef, ArrowError> {
     use arrow::array::*;
     Ok(match v {
         ScalarValueRepr::Bool(b) => Arc::new(BooleanArray::from(vec![*b])) as ArrayRef,
@@ -279,7 +280,13 @@ fn scalar_to_array(v: &ScalarValueRepr, _ty: &DataType) -> Result<ArrayRef, Arro
         ScalarValueRepr::I64(x) => Arc::new(Int64Array::from(vec![*x])),
         ScalarValueRepr::F32(x) => Arc::new(Float32Array::from(vec![*x])),
         ScalarValueRepr::F64(x) => Arc::new(Float64Array::from(vec![*x])),
-        ScalarValueRepr::Utf8(s) => Arc::new(StringArray::from(vec![s.as_str()])),
+        // Match the literal's array type to the column so arrow's comparison
+        // kernels (which require identical types) accept it: a `LargeUtf8`
+        // column needs a `LargeStringArray` literal, not a `StringArray`.
+        ScalarValueRepr::Utf8(s) => match ty {
+            DataType::LargeUtf8 => Arc::new(LargeStringArray::from(vec![s.as_str()])),
+            _ => Arc::new(StringArray::from(vec![s.as_str()])),
+        },
         ScalarValueRepr::Date32(d) => Arc::new(Date32Array::from(vec![*d])),
         ScalarValueRepr::TimestampMicros(t) => Arc::new(TimestampMicrosecondArray::from(vec![*t])),
         ScalarValueRepr::Decimal128(val, p, s) => {
@@ -768,5 +775,30 @@ mod tests {
             value: ScalarValueRepr::I32(5),
         });
         assert!(translate_qual_to_parquet_idx(e, &map).is_none());
+    }
+
+    #[test]
+    fn eval_leaf_largeutf8_column_matches_utf8_literal() {
+        // Regression: is_pushable accepts LargeUtf8, so the row filter must
+        // build a LargeStringArray literal for a LargeUtf8 column — otherwise
+        // arrow's cmp kernels reject the Utf8-vs-LargeUtf8 type mismatch and
+        // the scan errors out.
+        use arrow::array::LargeStringArray;
+        use arrow::datatypes::{Field, Schema};
+        assert!(is_pushable("=", &DataType::LargeUtf8));
+        let col: ArrayRef = Arc::new(LargeStringArray::from(vec!["a", "b", "a"]));
+        let schema = Schema::new(vec![Field::new("s", DataType::LargeUtf8, false)]);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![col]).unwrap();
+        let e = PushedExpr::Leaf(PushedQual {
+            col: 0,
+            op: PushedOp::Eq,
+            value: ScalarValueRepr::Utf8("a".to_string()),
+        });
+        let local_idx = |g: usize| -> Option<usize> { Some(g) };
+        let out = eval(&e, &batch, &schema, &local_idx).unwrap();
+        assert_eq!(
+            out.values().iter().collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
     }
 }

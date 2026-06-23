@@ -110,7 +110,7 @@ pub fn apply_edits_batch(
     // `end` fit u32 (clamp `end` defensively at the u32 boundary).
     let n_usize = batch.num_rows();
     let lo = base_offset as u32;
-    let hi = end.min(u32::MAX as u64 + 1) as u32;
+    let hi = end.min(u32::MAX as u64) as u32;
     let has_deletes_in_range = edits.deletes.range(lo..hi).next().is_some();
     if !has_deletes_in_range {
         return Ok(updated);

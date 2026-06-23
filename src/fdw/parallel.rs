@@ -90,10 +90,18 @@ pub(crate) unsafe fn dsm_deserialize_blobs(src: *const u8) -> FdwResult<DsmDeser
     // SAFETY: caller's contract — region was written by our serializer.
     let header_ptr = src as *const ParallelDsmStateHeader;
     let n_blobs = unsafe { (*header_ptr).n_blobs };
+    let total_payload_bytes = unsafe { (*header_ptr).total_payload_bytes };
     let mut out = Vec::with_capacity(n_blobs);
     // SAFETY: same as above; payload starts immediately after header.
     let mut cur = unsafe { src.add(std::mem::size_of::<ParallelDsmStateHeader>()) };
+    // Bound every read against the header's declared payload size, so a
+    // truncated/corrupted DSM segment yields an FdwError instead of an
+    // out-of-bounds read across the FFI boundary.
+    let mut bytes_read = 0usize;
     for _ in 0..n_blobs {
+        if bytes_read + 8 > total_payload_bytes {
+            return Err(FdwError::SchemaMismatch("DSM payload truncated".into()));
+        }
         let mut nl_buf = [0u8; 4];
         let mut el_buf = [0u8; 4];
         // SAFETY: bytes were written by serializer in matching layout.
@@ -103,8 +111,12 @@ pub(crate) unsafe fn dsm_deserialize_blobs(src: *const u8) -> FdwResult<DsmDeser
             std::ptr::copy_nonoverlapping(cur, el_buf.as_mut_ptr(), 4);
             cur = cur.add(4);
         }
+        bytes_read += 8;
         let nl = u32::from_le_bytes(nl_buf) as usize;
         let el = u32::from_le_bytes(el_buf) as usize;
+        if bytes_read + nl + el > total_payload_bytes {
+            return Err(FdwError::SchemaMismatch("DSM payload out of bounds".into()));
+        }
         let mut name_bytes = vec![0u8; nl];
         let mut etag_bytes = vec![0u8; el];
         // SAFETY: bytes still in our payload region.
@@ -114,6 +126,7 @@ pub(crate) unsafe fn dsm_deserialize_blobs(src: *const u8) -> FdwResult<DsmDeser
             std::ptr::copy_nonoverlapping(cur, etag_bytes.as_mut_ptr(), el);
             cur = cur.add(el);
         }
+        bytes_read += nl + el;
         // Names and etags from Azure are guaranteed valid UTF-8; defensively
         // route a corrupted DSM payload through FdwError rather than panicking
         // across the `extern "C-unwind"` FFI boundary.

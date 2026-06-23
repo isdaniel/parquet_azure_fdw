@@ -10,31 +10,33 @@ pub fn partition_values_from_path(
     declared: &[(String, PgPartitionType)],
 ) -> FdwResult<BTreeMap<String, String>> {
     let mut found: BTreeMap<String, String> = BTreeMap::new();
-    let declared_names: std::collections::HashSet<&str> =
-        declared.iter().map(|(n, _)| n.as_str()).collect();
 
     for segment in blob_name.split('/') {
         let Some((key, value)) = segment.split_once('=') else {
             continue;
         };
         // Only consider segments whose key matches a declared partition.
-        if !declared_names.contains(key) {
+        // PG identifiers are case-insensitive, so match case-insensitively
+        // and canonicalize to the declared name (the later presence check and
+        // tuple-keying both index by declared name).
+        let Some((decl_name, _)) = declared.iter().find(|(n, _)| n.eq_ignore_ascii_case(key))
+        else {
             continue;
-        }
+        };
         if value.is_empty() {
             return Err(FdwError::SchemaMismatch(format!(
-                "blob '{blob_name}' has empty value for partition key '{key}'"
+                "blob '{blob_name}' has empty value for partition key '{decl_name}'"
             )));
         }
         if value.contains('%') {
             return Err(FdwError::SchemaMismatch(format!(
-                "blob '{blob_name}' partition '{key}' value contains percent — \
+                "blob '{blob_name}' partition '{decl_name}' value contains percent — \
                  URL-encoded partition values are not supported in v1"
             )));
         }
-        if found.insert(key.to_string(), value.to_string()).is_some() {
+        if found.insert(decl_name.clone(), value.to_string()).is_some() {
             return Err(FdwError::SchemaMismatch(format!(
-                "blob '{blob_name}' has duplicate partition segment '{key}='"
+                "blob '{blob_name}' has duplicate partition segment '{decl_name}='"
             )));
         }
     }
