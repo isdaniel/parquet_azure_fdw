@@ -44,6 +44,26 @@ impl Compression {
             Compression::Gzip => PqCompression::GZIP(Default::default()),
         }
     }
+
+    /// Map a parquet-rs `Compression` value back to our user-facing enum.
+    ///
+    /// Parquet codec parameters (e.g. gzip level, zstd level) are NOT preserved
+    /// across the round-trip — we always rewrite using the codec's default
+    /// level. Acceptable because UPDATE/DELETE rewrites are an exact-row
+    /// operation, not a re-encode-for-storage optimization; default levels are
+    /// what fresh INSERTs would have produced anyway.
+    pub fn from_parquet(c: PqCompression) -> Self {
+        match c {
+            PqCompression::UNCOMPRESSED => Compression::None,
+            PqCompression::SNAPPY => Compression::Snappy,
+            PqCompression::GZIP(_) => Compression::Gzip,
+            PqCompression::ZSTD(_) => Compression::Zstd,
+            // Codecs we don't expose as INSERT options (LZ4, BROTLI, LZO, LZ4_RAW)
+            // round-trip to None — the rewrite is still correct, only the
+            // re-encoded blob loses the rare-codec choice. Acceptable v1.
+            _ => Compression::None,
+        }
+    }
 }
 
 /// In-memory parquet writer. `finish` consumes the writer and returns the

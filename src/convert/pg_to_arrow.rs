@@ -8,6 +8,13 @@
 //! The PG-side type matrix mirrors `arrow_to_pg.rs` so a write-then-read
 //! roundtrip is type-stable.
 
+/// Re-export so callers may use either `convert::datum_to_partition_string`
+/// or the historical `convert::pg_to_arrow::datum_to_partition_string` path.
+/// The implementation lives in the sibling `partition_datum` module because
+/// it requires `unsafe` (varlena detoast) and this file is
+/// `#![forbid(unsafe_code)]`.
+pub use super::partition_datum::datum_to_partition_string;
+
 use crate::error::{FdwError, FdwResult};
 use arrow::array::{
     ArrayBuilder, ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder,

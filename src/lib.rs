@@ -1,4 +1,5 @@
 #![deny(unsafe_code)]
+#![allow(clippy::result_large_err)]
 //! Crate root. `unsafe` is denied globally; `fdw::scan` and `fdw::modify`
 //! carve themselves out via `#[allow(unsafe_code)]` (they are the FFI
 //! boundary to Postgres' executor and additionally enable
@@ -17,9 +18,15 @@ pub mod runtime;
 #[cfg(feature = "pg_test")]
 pub mod test_harness;
 
+use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
 
 pgrx::pg_module_magic!();
+
+/// When off, a foreign table declared with `sorted` / `files_in_order` still
+/// returns correct rows, but via the sequential per-blob scan (no K-way
+/// merge; PG adds a Sort if the query needs ordering). Default on.
+pub(crate) static ENABLE_MULTIFILE: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// PG backend init hook. Runs once per backend (after `pg_module_magic!`
 /// registers the library). We use it to register our `XactCallback` for
@@ -28,6 +35,16 @@ pgrx::pg_module_magic!();
 #[pg_guard]
 extern "C-unwind" fn _PG_init() {
     crate::fdw::modify::coordinator::install_xact_callback_once();
+
+    GucRegistry::define_bool_guc(
+        c"parquet_fdw.enable_multifile",
+        c"Enable the multi-file K-way sorted-merge reader.",
+        c"When off, tables declared with `sorted`/`files_in_order` return \
+          correct rows via the sequential per-blob scan instead of the merge.",
+        &ENABLE_MULTIFILE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
 }
 
 /// FDW handler — returns an `FdwRoutine` populated with our callbacks.
@@ -64,6 +81,120 @@ extension_sql!(
     requires = [parquet_azure_fdw_handler, parquet_azure_fdw_validator],
 );
 
+// ---------------------------------------------------------------------------
+// SP-2 Task 5: SQL helpers wrapping IMPORT FOREIGN SCHEMA.
+//
+// `import_parquet_azure` is a thin SPI wrapper that builds an
+// `IMPORT FOREIGN SCHEMA … FROM SERVER … INTO …` statement and runs it; the
+// FDW's `ImportForeignSchema` callback (SP-2 Task 4) handles grouping +
+// schema inference + DDL emission.
+//
+// `import_parquet_azure_explicit` registers a single foreign table over an
+// explicit `<container>/<blob>` source. It resolves the server OID via the
+// catalog, then calls `client_for_server` → `infer_columns` →
+// `build_create_table_ddl` and runs the DDL via SPI. v1 supports exactly one
+// source per call; multi-source is rejected with `feature_not_supported`.
+// ---------------------------------------------------------------------------
+
+/// SQL-callable wrapper for IMPORT FOREIGN SCHEMA semantics.
+///
+/// - `server_name`: the FOREIGN SERVER to query.
+/// - `container`: the Azure container name (passed as the FDW's `container` OPTION).
+/// - `remote_prefix`: blob-name prefix to list under (passed as PG's
+///   `IMPORT FOREIGN SCHEMA <remote_schema>` identifier — the FDW callback
+///   treats this as the LIST prefix within the container; an empty prefix
+///   would mean "list everything" but PG requires a non-empty identifier
+///   here, so we reject empty `remote_prefix` explicitly).
+/// - `target_schema`: the local PG schema to import the foreign tables into.
+///
+/// Delegates to the FDW's own `ImportForeignSchema` callback via SPI.
+#[pg_extern(volatile)]
+fn import_parquet_azure(
+    server_name: &str,
+    container: &str,
+    remote_prefix: &str,
+    target_schema: &str,
+) -> Result<(), pgrx::pg_sys::panic::ErrorReport> {
+    if remote_prefix.is_empty() {
+        return Err(make_err(
+            "remote_prefix must be non-empty (PG IMPORT FOREIGN SCHEMA requires a name)".into(),
+        ));
+    }
+    let sql = format!(
+        "IMPORT FOREIGN SCHEMA {prefix} FROM SERVER {srv} INTO {schema} \
+         OPTIONS (container {cont})",
+        prefix = pgrx::spi::quote_identifier(remote_prefix),
+        srv = pgrx::spi::quote_identifier(server_name),
+        schema = pgrx::spi::quote_identifier(target_schema),
+        cont = pgrx::spi::quote_literal(container),
+    );
+    pgrx::Spi::run(&sql).map_err(map_spi_err)?;
+    Ok(())
+}
+
+/// SQL-callable helper that registers exactly one foreign table over an
+/// explicit blob source of the form `<container>/<blob>`. Multi-source is
+/// not yet supported in v1 and is rejected up front.
+#[pg_extern(volatile)]
+fn import_parquet_azure_explicit(
+    server_name: &str,
+    target_schema: &str,
+    table_name: &str,
+    sources: Vec<String>,
+) -> Result<(), pgrx::pg_sys::panic::ErrorReport> {
+    if sources.len() != 1 {
+        return Err(pgrx::pg_sys::panic::ErrorReport::new(
+            pgrx::PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
+            "import_parquet_azure_explicit currently supports exactly one source per call",
+            "",
+        ));
+    }
+    let source = &sources[0];
+
+    // Resolve server OID by name via the catalog.
+    let oid_sql = "SELECT oid FROM pg_foreign_server WHERE srvname = $1";
+    let server_oid: pgrx::pg_sys::Oid = pgrx::Spi::get_one_with_args(
+        oid_sql,
+        &[pgrx::datum::DatumWithOid::from(server_name.to_string())],
+    )
+    .map_err(map_spi_err)?
+    .ok_or_else(|| make_err(format!("server '{server_name}' not found")))?;
+
+    // v1: container is the first path segment, blob name is the rest.
+    let (container, blob_name) = match source.split_once('/') {
+        Some((c, b)) if !c.is_empty() && !b.is_empty() => (c.to_string(), b.to_string()),
+        _ => return Err(make_err("source must be '<container>/<blob>'".into())),
+    };
+
+    crate::fdw::options::validate_container_name(&container)
+        .map_err(|e| make_err(format!("{e}")))?;
+    crate::fdw::options::validate_blob_pattern(&blob_name, "source blob name")
+        .map_err(|e| make_err(format!("{e}")))?;
+
+    let client = crate::fdw::import_schema::client_for_server(server_oid, &container)
+        .map_err(|e| make_err(format!("{e}")))?;
+    let cols = crate::fdw::import_schema::infer_columns(&client, &blob_name)
+        .map_err(|e| make_err(format!("{e}")))?;
+    let ddl = crate::fdw::import_schema::build_create_table_ddl(
+        target_schema,
+        table_name,
+        server_name,
+        &container,
+        &blob_name,
+        &cols,
+    );
+    pgrx::Spi::run(&ddl).map_err(map_spi_err)?;
+    Ok(())
+}
+
+fn make_err(msg: String) -> pgrx::pg_sys::panic::ErrorReport {
+    pgrx::pg_sys::panic::ErrorReport::new(pgrx::PgSqlErrorCode::ERRCODE_FDW_ERROR, msg, "")
+}
+
+fn map_spi_err<E: std::fmt::Display>(e: E) -> pgrx::pg_sys::panic::ErrorReport {
+    make_err(format!("SPI: {e}"))
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
@@ -72,6 +203,20 @@ mod tests {
     #[pg_test]
     fn smoke() {
         assert_eq!(Spi::get_one::<i32>("SELECT 1").unwrap(), Some(1));
+    }
+
+    /// SP-2 Task 5: the explicit helper must reject multi-source calls
+    /// with `feature_not_supported`. Single-source happy-path requires a
+    /// real Azure backend and is deferred to a future smoke test.
+    #[pg_test(
+        error = "import_parquet_azure_explicit currently supports exactly one source per call"
+    )]
+    fn import_parquet_azure_explicit_rejects_multi_source() {
+        Spi::run(
+            "SELECT import_parquet_azure_explicit('srv', 'public', 'tab', \
+             ARRAY['c/a.parquet', 'c/b.parquet']);",
+        )
+        .unwrap();
     }
 
     /// Verify the extension loads cleanly and that the FDW handler +
@@ -958,6 +1103,358 @@ mod tests {
         let v1: Option<String> =
             Spi::get_one("SELECT name FROM mod_upd_then_sel WHERE id = 1").unwrap();
         assert_eq!(v1.as_deref(), Some("fresh"));
+    }
+
+    /// SP-3a Task 5: smoke test that `EXPLAIN` shows a `Gather` node for a
+    /// parallel-safe foreign scan. This fences the wiring of the 5 parallel
+    /// callbacks onto `FdwRoutine` AND the `add_partial_path` call in
+    /// `get_foreign_paths` that allows the planner to consider them.
+    #[cfg(feature = "pg_test")]
+    #[pg_test]
+    fn parallel_scan_explain_shows_gather() {
+        Spi::run("SET max_parallel_workers_per_gather = 2;").unwrap();
+        Spi::run("SET min_parallel_table_scan_size = 0;").unwrap();
+        Spi::run("SET parallel_setup_cost = 0;").unwrap();
+        Spi::run("SET parallel_tuple_cost = 0;").unwrap();
+
+        Spi::run(
+            "CREATE SERVER parallel_smoke_srv FOREIGN DATA WRAPPER parquet_azure_fdw \
+             OPTIONS (account_name 'devstoreaccount1', auth_method 'sas_url');",
+        )
+        .unwrap();
+        Spi::run(
+            "CREATE USER MAPPING FOR CURRENT_USER SERVER parallel_smoke_srv \
+             OPTIONS (sas_url 'https://devstoreaccount1.blob.core.windows.net/parallel-smoke?sv=2024-11-04&sig=stub');",
+        )
+        .unwrap();
+        Spi::run(
+            "CREATE FOREIGN TABLE parallel_smoke_t (id int) \
+             SERVER parallel_smoke_srv \
+             OPTIONS (container 'parallel-smoke', filename 'data/*.parquet', parallel_workers '2');",
+        )
+        .unwrap();
+
+        // Collect EXPLAIN output as one string. SpiTupleTable implements
+        // Iterator yielding SpiHeapTupleData; column ordinals are 1-based.
+        let plan: String = Spi::connect(|client| {
+            let table = client
+                .select(
+                    "EXPLAIN (COSTS off) SELECT id FROM parallel_smoke_t;",
+                    None,
+                    &[],
+                )
+                .expect("explain");
+            let mut lines: Vec<String> = Vec::new();
+            for row in table {
+                if let Ok(Some(s)) = row.get::<String>(1) {
+                    lines.push(s);
+                }
+            }
+            lines.join("\n")
+        });
+
+        assert!(
+            plan.contains("Gather"),
+            "EXPLAIN must show a Gather node; got plan:\n{plan}"
+        );
+
+        Spi::run("DROP FOREIGN TABLE parallel_smoke_t;").unwrap();
+        Spi::run("DROP USER MAPPING FOR CURRENT_USER SERVER parallel_smoke_srv;").unwrap();
+        Spi::run("DROP SERVER parallel_smoke_srv;").unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // SP-3c sorted-merge `#[pg_test]` coverage. These drive REAL SELECTs
+    // through the in-process wiremock fake (same wiring as the SELECT suite
+    // above), so they exercise the scan-begin `build_state` sorted branch:
+    // the same-type guard, the partitioned+sorted rejection, the C1
+    // projection fix, and the planner's pathkey/EXPLAIN behaviour.
+    // -------------------------------------------------------------------
+
+    /// SQL that wires Server + UserMapping + a `(id BIGINT, name TEXT)`
+    /// foreign table in `sorted 'id'` + `files_in_order 'true'` mode.
+    #[cfg(feature = "pg_test")]
+    fn install_sorted_objects_sql(
+        suffix: &str,
+        fake: &FakeBlobStore,
+        container: &str,
+        filename: &str,
+    ) -> String {
+        let sas = fake.sas_url(container);
+        format!(
+            r#"
+            DROP FOREIGN TABLE IF EXISTS sorted_{suffix} CASCADE;
+            DROP USER MAPPING IF EXISTS FOR CURRENT_USER SERVER sz_{suffix};
+            DROP SERVER IF EXISTS sz_{suffix} CASCADE;
+
+            CREATE SERVER sz_{suffix} FOREIGN DATA WRAPPER parquet_azure_fdw
+              OPTIONS (account_name 'fakeaccount',
+                       endpoint 'blob.core.windows.net',
+                       auth_method 'sas_url');
+            CREATE USER MAPPING FOR CURRENT_USER SERVER sz_{suffix}
+              OPTIONS (sas_url '{sas}');
+            CREATE FOREIGN TABLE sorted_{suffix} (id bigint, name text)
+              SERVER sz_{suffix}
+              OPTIONS (container '{container}', filename '{filename}',
+                       sorted 'id', files_in_order 'true');
+            "#
+        )
+    }
+
+    /// SP-3c: a sorted-mode SELECT must merge multiple blobs into one globally
+    /// ASC stream. Three blobs whose `id` ranges interleave (1/4/7, 2/5/8,
+    /// 3/6/9) must come back fully merged. Also exercises the C1 projection
+    /// fix indirectly (full row materialization under sorted mode).
+    #[cfg(feature = "pg_test")]
+    #[pg_test]
+    fn sorted_select_merges_blobs_globally() {
+        let fake = FakeBlobStore::start_blocking();
+        let container = "test-sorted-merge";
+        fake.put_blob(
+            container,
+            "s/a.parquet",
+            build_simple_parquet(&[1, 4, 7], &["a", "d", "g"]),
+        );
+        fake.put_blob(
+            container,
+            "s/b.parquet",
+            build_simple_parquet(&[2, 5, 8], &["b", "e", "h"]),
+        );
+        fake.put_blob(
+            container,
+            "s/c.parquet",
+            build_simple_parquet(&[3, 6, 9], &["c", "f", "i"]),
+        );
+
+        Spi::run(&install_sorted_objects_sql(
+            "merge",
+            &fake,
+            container,
+            "s/*.parquet",
+        ))
+        .expect("install sorted objects");
+
+        // string_agg with NO ORDER BY reflects the raw scan emission order;
+        // sorted-mode must already produce globally-ascending rows.
+        let ids: Option<String> =
+            Spi::get_one("SELECT string_agg(id::text, ',') FROM sorted_merge").expect("agg");
+        assert_eq!(ids.as_deref(), Some("1,2,3,4,5,6,7,8,9"));
+    }
+
+    /// SP-4: with `parquet_fdw.enable_multifile = off`, a table declared
+    /// `sorted` must still return all rows correctly — via the sequential
+    /// path (no K-way merge). Correctness is the binding assertion; the path
+    /// switch itself is internal.
+    #[cfg(feature = "pg_test")]
+    #[pg_test]
+    fn enable_multifile_off_still_returns_rows() {
+        let fake = FakeBlobStore::start_blocking();
+        let container = "test-enable-multifile-off";
+        fake.put_blob(
+            container,
+            "e/a.parquet",
+            build_simple_parquet(&[1, 2, 3], &["a", "b", "c"]),
+        );
+        Spi::run("SET parquet_fdw.enable_multifile = off;").unwrap();
+        Spi::run(&install_sorted_objects_sql(
+            "mfoff",
+            &fake,
+            container,
+            "e/*.parquet",
+        ))
+        .expect("install sorted objects");
+
+        // All rows must come back (order not asserted — sequential path may
+        // not be globally sorted across blobs without the merge).
+        let n: Option<i64> = Spi::get_one("SELECT count(*) FROM sorted_mfoff").expect("count");
+        assert_eq!(n, Some(3), "all rows must return with merge disabled");
+
+        Spi::run("DROP FOREIGN TABLE sorted_mfoff;").unwrap();
+        Spi::run("DROP USER MAPPING FOR CURRENT_USER SERVER sz_mfoff;").unwrap();
+        Spi::run("DROP SERVER sz_mfoff;").unwrap();
+        Spi::run("RESET parquet_fdw.enable_multifile;").unwrap();
+    }
+
+    /// SP-3c C1 REGRESSION: a projected SELECT that picks a proper subset /
+    /// reorder of columns under sorted mode must return CORRECT values in each
+    /// column (not swapped). Task 3 forced no-projection + identity attno_map
+    /// in sorted mode; this guards against the swapped-column bug it fixed.
+    ///
+    /// We use a 3-column `(a BIGINT, b TEXT, c BIGINT)` table and
+    /// `SELECT a, c ... ORDER BY a`, then assert the (a, c) pairs are the ones
+    /// we authored — if a/c were mis-mapped, the c values would be wrong.
+    #[cfg(feature = "pg_test")]
+    #[pg_test]
+    fn sorted_projected_select_returns_correct_columns() {
+        use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        // Build a 3-column blob: a=[1,3], b=["x","z"], c=[100,300].
+        // c = a*100, so a swap of a/c is trivially detectable.
+        fn three_col(a: &[i64], b: &[&str], c: &[i64]) -> bytes::Bytes {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Utf8, false),
+                Field::new("c", DataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(a.to_vec())) as Arc<dyn Array>,
+                    Arc::new(StringArray::from(b.to_vec())),
+                    Arc::new(Int64Array::from(c.to_vec())),
+                ],
+            )
+            .unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut w =
+                ArrowWriter::try_new(&mut buf, schema, Some(WriterProperties::builder().build()))
+                    .unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            bytes::Bytes::from(buf)
+        }
+
+        let fake = FakeBlobStore::start_blocking();
+        let container = "test-sorted-proj";
+        fake.put_blob(
+            container,
+            "p/a.parquet",
+            three_col(&[1, 3], &["x", "z"], &[100, 300]),
+        );
+        fake.put_blob(
+            container,
+            "p/b.parquet",
+            three_col(&[2, 4], &["y", "w"], &[200, 400]),
+        );
+
+        let sas = fake.sas_url(container);
+        Spi::run(&format!(
+            r#"
+            CREATE SERVER sz_proj FOREIGN DATA WRAPPER parquet_azure_fdw
+              OPTIONS (account_name 'fakeaccount', endpoint 'blob.core.windows.net',
+                       auth_method 'sas_url');
+            CREATE USER MAPPING FOR CURRENT_USER SERVER sz_proj
+              OPTIONS (sas_url '{sas}');
+            CREATE FOREIGN TABLE sorted_proj (a bigint, b text, c bigint)
+              SERVER sz_proj
+              OPTIONS (container '{container}', filename 'p/*.parquet',
+                       sorted 'a', files_in_order 'true');
+            "#
+        ))
+        .expect("install");
+
+        // SELECT a, c (subset + drop b) ORDER BY a. c must equal a*100.
+        let pairs: Option<String> = Spi::get_one(
+            "SELECT string_agg(a::text || ':' || c::text, ',' ORDER BY a) FROM sorted_proj",
+        )
+        .expect("agg");
+        assert_eq!(
+            pairs.as_deref(),
+            Some("1:100,2:200,3:300,4:400"),
+            "projected (a, c) values must be correct (C1 regression)"
+        );
+
+        Spi::run("DROP FOREIGN TABLE sorted_proj;").unwrap();
+        Spi::run("DROP USER MAPPING FOR CURRENT_USER SERVER sz_proj;").unwrap();
+        Spi::run("DROP SERVER sz_proj;").unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // DEFERRED scan-begin error coverage (same-type guard,
+    // partitioned+sorted reject).
+    //
+    // Both guards live in `fdw::scan::build_state` and raise an
+    // `FdwError::SchemaMismatch` via `error::raise` (a Postgres ereport
+    // ERROR) from inside the raw `extern "C-unwind"` `begin_foreign_scan`
+    // callback. Driving them from a `#[pg_test]` is NOT viable on this
+    // harness: the ereport's C `siglongjmp` unwinds through the Rust scan
+    // frames that still own the tokio runtime handle + `AzureBlobClient` +
+    // open parquet streams, and the backend aborts (signal 6) before the
+    // error can surface to the client as a recoverable `DbError`. Neither
+    // `#[pg_test(error = ...)]` nor `Spi::run(...).expect_err` survives it —
+    // the whole `SELECT tests.<fn>()` call crashes the backend. (Every
+    // existing `#[pg_test(error = ...)]` in this file targets a CREATE-time
+    // *validator* error, which is raised from a different callback that does
+    // not have tokio/SDK state on the stack — those work; scan-begin ones do
+    // not.)
+    //
+    // What IS covered instead:
+    //   * The partitioned+sorted reject is a pure-logic guard
+    //     (`if !core.partition_attnums.is_empty() { return Err(..) }`,
+    //     scan.rs) executed before any row is produced; it has no I/O
+    //     dependency and is exercised by manual / live (`cargo pgrx test
+    //     pg14`) runs. NOTE: under `cargo pgrx test pg14` the same backend
+    //     abort applies, so this remains a code-review + manual-SELECT
+    //     assurance, not an automated assertion. Documented limitation.
+    //   * The same-type guard's CORE CHECK — reading each blob's arrow
+    //     schema and comparing the sort column's `DataType` across blobs —
+    //     is reproduced and asserted directly against the fake blob store in
+    //     `tests/multifile_sorted.rs::same_type_guard_detects_mismatched_sort_col_type`
+    //     (a plain `cargo test`, no executor, no ereport). That test exercises
+    //     the exact comparison `build_state` performs; only the final
+    //     `error::raise` plumbing is left to manual verification.
+    // -------------------------------------------------------------------
+
+    /// SP-3c EXPLAIN check (brief Step 3). Task 4 took the NULL-pathkeys
+    /// fallback, so PG WILL add a Sort node above the sorted ForeignScan.
+    /// The merge still produces globally-sorted output, so this asserts only
+    /// the WEAK property: a ForeignScan node exists. The strong "no Sort node"
+    /// assertion is left commented out — it is blocked on PathKey emission
+    /// (a future SP) and would fail given Task 4's documented fallback.
+    #[cfg(feature = "pg_test")]
+    #[pg_test]
+    fn sorted_explain_has_foreign_scan() {
+        let fake = FakeBlobStore::start_blocking();
+        let container = "test-sorted-explain";
+        fake.put_blob(
+            container,
+            "e/a.parquet",
+            build_simple_parquet(&[1, 2, 3], &["a", "b", "c"]),
+        );
+
+        Spi::run(&install_sorted_objects_sql(
+            "explain",
+            &fake,
+            container,
+            "e/*.parquet",
+        ))
+        .expect("install sorted objects");
+
+        let plan: String = Spi::connect(|client| {
+            let table = client
+                .select(
+                    "EXPLAIN (COSTS off) SELECT id FROM sorted_explain ORDER BY id;",
+                    None,
+                    &[],
+                )
+                .expect("explain");
+            let mut lines: Vec<String> = Vec::new();
+            for row in table {
+                if let Ok(Some(s)) = row.get::<String>(1) {
+                    lines.push(s);
+                }
+            }
+            lines.join("\n")
+        });
+
+        // WEAK assertion: ForeignScan exists. The sorted merge yields
+        // globally-sorted output regardless of pathkey emission.
+        assert!(
+            plan.contains("Foreign Scan"),
+            "plan must contain a Foreign Scan; got:\n{plan}"
+        );
+        // STRONG assertion — BLOCKED on PathKey emission (future SP). Task 4
+        // fell back to NULL pathkeys, so PG adds a Sort node above the scan.
+        // Leave commented; uncommenting would fail today.
+        // assert!(!plan.contains("Sort"), "Sort node above ForeignScan; pathkey emission failed:\n{plan}");
+
+        Spi::run("DROP FOREIGN TABLE sorted_explain;").unwrap();
+        Spi::run("DROP USER MAPPING FOR CURRENT_USER SERVER sz_explain;").unwrap();
+        Spi::run("DROP SERVER sz_explain;").unwrap();
     }
 }
 

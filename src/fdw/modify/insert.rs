@@ -50,14 +50,16 @@ use crate::convert::pg_to_arrow::{pg_attrs_to_arrow_schema, RecordBatchBuilders}
 use crate::error::{raise, FdwError, FdwResult};
 use crate::fdw::options::{
     parse_server_options_from_slice, parse_table_options_from_slice,
-    parse_user_mapping_options_from_slice, validate_combo, TableOptions,
+    parse_user_mapping_options_from_slice, validate_combo, PgPartitionType, TableOptions,
 };
+use crate::fdw::partition::PartitionTupleKey;
 use crate::parquet_io::writer::ParquetBatchWriter;
 use crate::parquet_io::Compression;
 use crate::runtime;
 
 use arrow::datatypes::SchemaRef;
 use pgrx::pg_sys;
+use std::collections::HashMap;
 use std::ffi::{c_int, c_void, CStr};
 
 /// Buffered rows before flushing a `RecordBatch` to the parquet writer.
@@ -68,27 +70,49 @@ const BATCH_ROWS: usize = 8192;
 /// Per-INSERT executor state, owned by PG via `Box::into_raw` /
 /// `Box::from_raw` round-trip through `ResultRelInfo.ri_FdwState`.
 pub struct InsertState {
-    /// Column-aligned Arrow array builders for the in-progress batch.
-    /// Re-allocated after each flush.
-    builders: RecordBatchBuilders,
-    /// Cached schema — needed both to re-create builders after each flush and
-    /// to construct the per-batch `RecordBatch`.
+    /// Storage-column Arrow schema. EXCLUDES partition columns (those are
+    /// encoded in the blob path, not in the parquet data). For
+    /// non-partitioned tables this is the full tupdesc schema.
     schema: SchemaRef,
     /// Per-attribute pg type OIDs in tupdesc order. Used by `append_slot`
     /// to dispatch to the right typed builder helper.
     pg_oids: Vec<pg_sys::Oid>,
-    /// In-memory parquet writer. Buffers the whole file before upload.
-    writer: ParquetBatchWriter,
     /// Container-scoped Azure client; cheap to clone.
     client: AzureBlobClient,
-    /// Target blob name chosen at BEGIN time (timestamp + uuid).
-    target_name: String,
-    /// Compression codec (stored only for diagnostics; the writer already
-    /// carries it).
-    #[allow(dead_code)]
+    /// Compression codec for newly-written blobs (also threaded into each
+    /// per-group `ParquetBatchWriter` lazily on first append to that group).
     compression: Compression,
-    /// Rows in the in-progress (un-finalized) builder batch.
-    rows_in_current_batch: usize,
+    /// 0-based attnums of the partition columns (cached for hot-path access
+    /// in `append_slot`). Empty for non-partitioned tables.
+    partition_attnums: Vec<usize>,
+    /// Declared (name, type) for each partition column, in declaration
+    /// order. Used to format per-group blob paths
+    /// (`base_prefix/key=val/key=val/...`).
+    partition_keys_decl: Vec<(String, PgPartitionType)>,
+    /// Path prefix derived from the table option `filename` glob. Per-group
+    /// blob names are built as `generate_blob_name(base_prefix/seg/seg/...)`.
+    base_prefix: String,
+    /// Target blob name for the empty-key (non-partitioned) fall-through.
+    /// Preserved verbatim for the legacy "literal filename, no glob" case so
+    /// non-partitioned tables keep their single-blob-per-statement semantics.
+    ///
+    /// Dead state when `partition_attnums` is non-empty: partitioned INSERTs
+    /// always derive per-group blob names via `generate_blob_name` under
+    /// `base_prefix/key=val/...` and never consult this field.
+    legacy_single_target: Option<String>,
+    /// Per-partition-tuple in-progress builders. For non-partitioned tables
+    /// this map has exactly one entry keyed by the empty `PartitionTupleKey`.
+    /// Entries are created lazily on first row routed to a group.
+    builders: HashMap<PartitionTupleKey, RecordBatchBuilders>,
+    /// Per-group accumulated parquet bytes — one writer per group, created
+    /// lazily on the first BATCH_ROWS flush for that group.
+    writers: HashMap<PartitionTupleKey, ParquetBatchWriter>,
+    /// Per-group target blob name, fixed when the group is first observed.
+    /// Ensures all rows for one tuple key land in the same blob.
+    target_names: HashMap<PartitionTupleKey, String>,
+    /// Per-group in-progress row counts (for BATCH_ROWS check + empty-group
+    /// detection at finalize).
+    rows_in_current_batch: HashMap<PartitionTupleKey, usize>,
 }
 
 // ---------- public callbacks ------------------------------------------------
@@ -233,8 +257,23 @@ pub unsafe extern "C-unwind" fn exec_foreign_insert(
         raise(e);
     }
 
-    if insert_state.rows_in_current_batch >= BATCH_ROWS {
-        if let Err(e) = flush_batch(insert_state) {
+    // Per-group BATCH_ROWS threshold check. We flush ANY group that has
+    // reached the cap, not the whole state — keeps memory bounded under
+    // skewed partition distributions (one heavy group + many tiny groups
+    // shouldn't all flush together).
+    let to_flush: Vec<PartitionTupleKey> = insert_state
+        .rows_in_current_batch
+        .iter()
+        .filter_map(|(k, &n)| {
+            if n >= BATCH_ROWS {
+                Some(k.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for key in to_flush {
+        if let Err(e) = flush_group(insert_state, &key) {
             raise(e);
         }
     }
@@ -346,38 +385,97 @@ unsafe fn build_state(rel: pg_sys::Relation, relid: pg_sys::Oid) -> FdwResult<In
         (attrs, oids)
     };
 
-    let schema = pg_attrs_to_arrow_schema(&attrs)?;
-    let builders = RecordBatchBuilders::new(schema.clone(), BATCH_ROWS)?;
-    let writer = ParquetBatchWriter::new(schema.clone(), table_opts.compression)?;
+    // --- partition resolution ------------------------------------------
+    // Mirrors `scan.rs::build_scan_state_core`: look up declared partition
+    // column names in the tupdesc (case-insensitive). Empty when the table
+    // is not partitioned.
+    let partition_attnums: Vec<usize> = if table_opts.partition_columns.is_empty() {
+        Vec::new()
+    } else {
+        // SAFETY: tupdesc live; `tupdesc_attr` is the version-portable
+        // accessor; `attname` is a fixed-size NameData with a NUL-terminated
+        // C string in-bounds — same shape as `scan.rs`.
+        unsafe {
+            let tupdesc = (*rel).rd_att;
+            let natts = (*tupdesc).natts as usize;
+            let mut out = Vec::with_capacity(table_opts.partition_columns.len());
+            for name in &table_opts.partition_columns {
+                let mut found: Option<usize> = None;
+                for i in 0..natts {
+                    let att = crate::fdw::tupdesc_attr(tupdesc, i);
+                    let nm =
+                        CStr::from_ptr((*att).attname.data.as_ptr() as *const _).to_string_lossy();
+                    if nm.eq_ignore_ascii_case(name) {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                let attno = found.ok_or_else(|| {
+                    FdwError::SchemaMismatch(format!(
+                        "partition_columns names '{name}' but no such column in foreign table"
+                    ))
+                })?;
+                out.push(attno);
+            }
+            out
+        }
+    };
 
-    let target_name = pick_target_name(&table_opts);
+    // Storage schema: drop partition columns from the Arrow schema so the
+    // parquet blob only carries non-partition columns (Hive convention —
+    // partition values are in the path, not the file).
+    let storage_attrs: Vec<pg_sys::FormData_pg_attribute> = attrs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            if partition_attnums.contains(&i) {
+                None
+            } else {
+                Some(*a)
+            }
+        })
+        .collect();
+    let schema = pg_attrs_to_arrow_schema(&storage_attrs)?;
+
+    let (base_prefix, legacy_single_target) = pick_target_layout(&table_opts);
 
     Ok(InsertState {
-        builders,
         schema,
         pg_oids,
-        writer,
         client,
-        target_name,
         compression: table_opts.compression,
-        rows_in_current_batch: 0,
+        partition_attnums,
+        partition_keys_decl: table_opts.partition_keys.clone(),
+        base_prefix,
+        legacy_single_target,
+        builders: HashMap::new(),
+        writers: HashMap::new(),
+        target_names: HashMap::new(),
+        rows_in_current_batch: HashMap::new(),
     })
 }
 
-/// Derive the upload target blob name from the table option.
+/// Derive (base_prefix, legacy_single_target) from the table option.
 ///
-/// If the user gave a literal blob name (no `*`), reuse it verbatim — that's
-/// the natural one-blob-per-table case. If they gave a glob, treat the
-/// portion before `*` as a prefix and synthesize a `{prefix}{ts}-{uuid}.parquet`
-/// name so each INSERT lands in a fresh blob (matches the read-side glob
-/// expansion: `dir/*` → write to `dir/`).
-fn pick_target_name(opts: &TableOptions) -> String {
+/// - Glob (`dir/*` or `dir/prefix*`): `base_prefix = "dir"` (or "dir/prefix"
+///   without the `*`), trimmed of trailing `/`. No legacy single-target —
+///   every group lands in a fresh `generate_blob_name`-style file.
+/// - Literal filename: `base_prefix = dirname(fname)`; we ALSO record the
+///   literal name as `legacy_single_target` so non-partitioned tables keep
+///   writing to a single blob (matches pre-SP-3b behavior). Partitioned
+///   tables ignore the literal target — they always synthesize per-group
+///   names under the dirname prefix.
+fn pick_target_layout(opts: &TableOptions) -> (String, Option<String>) {
     let fname = opts.filename.as_str();
     if let Some(star) = fname.find('*') {
-        let prefix = &fname[..star];
-        generate_blob_name(prefix)
+        let prefix = fname[..star].trim_end_matches('/').to_string();
+        (prefix, None)
     } else {
-        fname.to_string()
+        let dir = match fname.rfind('/') {
+            Some(idx) => fname[..idx].to_string(),
+            None => String::new(),
+        };
+        (dir, Some(fname.to_string()))
     }
 }
 
@@ -396,19 +494,93 @@ unsafe fn append_slot(state: &mut InsertState, slot: *mut pg_sys::TupleTableSlot
     // number within `state.pg_oids.len()`.
     let (values, isnulls) = unsafe { ((*slot).tts_values, (*slot).tts_isnull) };
 
-    for (i, &oid) in state.pg_oids.iter().enumerate() {
-        // SAFETY: `i < state.pg_oids.len() <= tts_nvalid` by construction
-        // above, so the offset stays within the slot's value/null arrays.
-        let is_null = unsafe { *isnulls.add(i) };
-        // SAFETY: same bound as `is_null` above.
-        let datum = unsafe { *values.add(i) };
-        // SAFETY: `i` indexes both `state.pg_oids` and `state.builders`,
-        // which were built in parallel; `oid` and (datum, is_null) describe
-        // the same column.
-        unsafe { append_one(&mut state.builders, i, oid, datum, is_null) }?;
+    // 1) Derive the partition tuple key from this row's partition-column
+    //    datums. Empty key (single group) for non-partitioned tables.
+    let key = if state.partition_attnums.is_empty() {
+        PartitionTupleKey { values: Vec::new() }
+    } else {
+        let mut vals: Vec<String> = Vec::with_capacity(state.partition_attnums.len());
+        for &attno in &state.partition_attnums {
+            // SAFETY: `attno < natts ≤ tts_nvalid` after `slot_getallattrs`.
+            let is_null = unsafe { *isnulls.add(attno) };
+            if is_null {
+                return Err(FdwError::SchemaMismatch(format!(
+                    "partition column attno {attno} cannot be NULL"
+                )));
+            }
+            // SAFETY: same bound as `is_null`.
+            let datum = unsafe { *values.add(attno) };
+            // SAFETY: `datum` is a valid datum of type `pg_oids[attno]`;
+            // `datum_to_partition_string`'s contract matches `append_one`.
+            let s =
+                unsafe { crate::convert::datum_to_partition_string(datum, state.pg_oids[attno])? };
+            vals.push(s);
+        }
+        PartitionTupleKey { values: vals }
+    };
+
+    // 2) Ensure builders, target name, and row count exist for this group.
+    let schema = state.schema.clone();
+    state.builders.entry(key.clone()).or_insert_with(|| {
+        RecordBatchBuilders::new(schema.clone(), BATCH_ROWS)
+            .expect("RecordBatchBuilders::new should not fail for a validated schema")
+    });
+    if !state.target_names.contains_key(&key) {
+        let name = compute_target_name(state, &key);
+        state.target_names.insert(key.clone(), name);
     }
-    state.rows_in_current_batch += 1;
+    let builders = state
+        .builders
+        .get_mut(&key)
+        .expect("inserted above by or_insert_with");
+
+    // 3) Walk slot columns, appending non-partition cols to the storage
+    //    builders in storage-schema order. Partition cols are skipped — they
+    //    live in the blob path, not the parquet data.
+    let mut storage_col = 0usize;
+    for (i, &oid) in state.pg_oids.iter().enumerate() {
+        if state.partition_attnums.contains(&i) {
+            continue;
+        }
+        // SAFETY: `i < state.pg_oids.len() ≤ tts_nvalid`.
+        let is_null = unsafe { *isnulls.add(i) };
+        // SAFETY: same bound.
+        let datum = unsafe { *values.add(i) };
+        // SAFETY: `(oid, datum, is_null)` describe one storage column;
+        // `storage_col` indexes the storage-schema builders.
+        unsafe { append_one(builders, storage_col, oid, datum, is_null) }?;
+        storage_col += 1;
+    }
+
+    *state.rows_in_current_batch.entry(key).or_insert(0) += 1;
     Ok(())
+}
+
+/// Pick the target blob name for `key`. For non-partitioned tables with a
+/// literal `filename` option, reuse the literal name (`legacy_single_target`).
+/// Otherwise synthesize `generate_blob_name(base_prefix[/seg=val/...])`.
+fn compute_target_name(state: &InsertState, key: &PartitionTupleKey) -> String {
+    if key.values.is_empty() {
+        if let Some(literal) = &state.legacy_single_target {
+            return literal.clone();
+        }
+        return generate_blob_name(&state.base_prefix);
+    }
+    let mut path = state.base_prefix.clone();
+    for (i, value) in key.values.iter().enumerate() {
+        if !path.is_empty() && !path.ends_with('/') {
+            path.push('/');
+        }
+        let name = state
+            .partition_keys_decl
+            .get(i)
+            .map(|(n, _)| n.as_str())
+            .unwrap_or("p");
+        path.push_str(name);
+        path.push('=');
+        path.push_str(value);
+    }
+    generate_blob_name(&path)
 }
 
 // ---------- version-portable Datum -> primitive helpers --------------------
@@ -542,65 +714,146 @@ unsafe fn text_datum_to_str(datum: pg_sys::Datum) -> FdwResult<String> {
     Ok(s)
 }
 
-/// Finalize the in-progress builder into a `RecordBatch`, write it to the
-/// parquet writer, and reset the builders for the next chunk.
-fn flush_batch(state: &mut InsertState) -> FdwResult<()> {
-    if state.rows_in_current_batch == 0 {
+/// Flush one group's in-progress builder into its per-group ParquetBatchWriter
+/// (creating the writer lazily on first flush). Bounded by MAX_BLOB_BYTES on
+/// the per-group accumulator.
+fn flush_group(state: &mut InsertState, key: &PartitionTupleKey) -> FdwResult<()> {
+    let n = state.rows_in_current_batch.get(key).copied().unwrap_or(0);
+    if n == 0 {
         return Ok(());
     }
-    // Swap out the builders so we can take ownership for `finish()` while
-    // keeping `state` borrow-safe.
     let fresh = RecordBatchBuilders::new(state.schema.clone(), BATCH_ROWS)?;
-    let old = std::mem::replace(&mut state.builders, fresh);
+    let old = state
+        .builders
+        .insert(key.clone(), fresh)
+        .expect("group's builders present (created in append_slot)");
     let batch = old.finish()?;
-    state.writer.write(&batch)?;
-    // Cap the in-progress parquet accumulator at MAX_BLOB_BYTES. Without
-    // this, a `COPY ... FROM` of a multi-GiB source grows the ArrowWriter's
-    // internal Vec<u8> unbounded — `AzureBlobWriter::upload`'s MAX_BLOB_BYTES
-    // check only fires AFTER the writer is finalised, by which point the
-    // backend has already OOMed. We refuse early with a clear error so the
-    // user can split the load. (Note: `bytes_written` is a lower bound;
-    // unflushed row-group buffers may add a few MiB more, comfortably below
-    // the MaxAllocSize headroom.)
-    let written = state.writer.bytes_written() as u64;
+
+    // Get-or-create the per-group parquet writer (lazy: empty groups never
+    // allocate a writer).
+    let compression = state.compression;
+    let schema = state.schema.clone();
+    if !state.writers.contains_key(key) {
+        state
+            .writers
+            .insert(key.clone(), ParquetBatchWriter::new(schema, compression)?);
+    }
+    let writer = state.writers.get_mut(key).expect("inserted above");
+    writer.write(&batch)?;
+
+    // Same MAX_BLOB_BYTES guard as the pre-SP-3b single-writer path, applied
+    // per group. With partition routing a runaway COPY could OOM ANY one
+    // group; the check here fires once per group reaches the cap.
+    let written = writer.bytes_written() as u64;
     if written > crate::azure::MAX_BLOB_BYTES {
         return Err(crate::error::FdwError::Azure(format!(
-            "INSERT/COPY accumulator: {written} bytes written exceeds \
+            "INSERT/COPY accumulator: group rendered {written} bytes — exceeds \
              MAX_BLOB_BYTES={cap}; split the load into multiple statements \
-             or smaller batches",
+             or smaller batches (per-partition groups are bounded \
+             independently)",
             cap = crate::azure::MAX_BLOB_BYTES
         )));
     }
-    state.rows_in_current_batch = 0;
+    state.rows_in_current_batch.insert(key.clone(), 0);
     Ok(())
 }
 
-/// Flush the tail batch, finalize the parquet footer, and upload the bytes.
-fn finalize_and_upload(mut state: InsertState) -> FdwResult<()> {
-    // Tail flush.
-    if state.rows_in_current_batch > 0 {
-        flush_batch(&mut state)?;
-    }
-    // If no rows were ever inserted, skip the upload entirely: writing a
-    // zero-row parquet file is legal but probably not what the user wants
-    // for an empty `INSERT ... SELECT ... WHERE false`.
-    let InsertState {
-        writer,
-        client,
-        target_name,
-        rows_in_current_batch: _,
-        builders: _,
-        schema: _,
-        pg_oids: _,
-        compression: _,
-    } = state;
+/// Test-only entry that drives the per-group finalize + upload path without
+/// going through the executor / slot decoder. For each non-empty
+/// `(key, [RecordBatch])` it constructs a per-group `ParquetBatchWriter`,
+/// writes the batches, picks the per-group target blob name via the same
+/// `compute_target_name` helper the production path uses, and uploads.
+/// Returns the `(key, blob_name)` pairs that were actually uploaded so the
+/// caller can assert per-tuple routing.
+///
+/// Used by `tests/partition_write.rs` to assert:
+/// - multi-tuple routing produces one blob per distinct tuple key, at the
+///   expected `base_prefix/key=val/.../{ts}-{uuid}.parquet` paths;
+/// - empty groups (zero rows for a key) produce NO blob.
+#[cfg(any(test, feature = "pg_test"))]
+pub fn finalize_and_upload_for_test(
+    schema: SchemaRef,
+    compression: Compression,
+    client: AzureBlobClient,
+    base_prefix: String,
+    legacy_single_target: Option<String>,
+    partition_keys_decl: Vec<(String, PgPartitionType)>,
+    groups: HashMap<PartitionTupleKey, Vec<arrow::array::RecordBatch>>,
+) -> FdwResult<Vec<(PartitionTupleKey, String)>> {
+    // Stub state purely for `compute_target_name`'s layout fields.
+    let stub = InsertState {
+        schema: schema.clone(),
+        pg_oids: Vec::new(),
+        client: client.clone(),
+        compression,
+        partition_attnums: Vec::new(),
+        partition_keys_decl,
+        base_prefix,
+        legacy_single_target,
+        builders: HashMap::new(),
+        writers: HashMap::new(),
+        target_names: HashMap::new(),
+        rows_in_current_batch: HashMap::new(),
+    };
 
-    let bytes = writer.finish()?;
-    // Always upload — even a header-only parquet file is a valid record of
-    // the (possibly zero-row) write. This matches what a `COPY ... TO`
-    // would do.
-    let blob_writer = AzureBlobWriter::new(&client, &target_name);
-    runtime::block_on(blob_writer.upload(bytes))?;
+    // Collect non-empty groups in sorted key order so the upload order (and
+    // hence test-observable timestamps) is deterministic.
+    let mut sorted: Vec<(PartitionTupleKey, Vec<arrow::array::RecordBatch>)> = groups
+        .into_iter()
+        .filter(|(_, batches)| batches.iter().any(|b| b.num_rows() > 0))
+        .collect();
+    sorted.sort_by(|a, b| a.0.values.cmp(&b.0.values));
+
+    let mut uploaded: Vec<(PartitionTupleKey, String)> = Vec::with_capacity(sorted.len());
+    for (key, batches) in sorted {
+        let mut writer = ParquetBatchWriter::new(schema.clone(), compression)?;
+        for b in &batches {
+            writer.write(b)?;
+        }
+        let bytes = writer.finish()?;
+        let target_name = compute_target_name(&stub, &key);
+        let blob_writer = AzureBlobWriter::new(&client, &target_name);
+        runtime::block_on(blob_writer.upload(bytes))?;
+        uploaded.push((key, target_name));
+    }
+    Ok(uploaded)
+}
+
+/// Flush every group's tail batch, finalize each group's parquet writer, and
+/// upload one blob per non-empty group. Groups that never had a row appended
+/// (and were therefore never inserted into the maps) produce no upload —
+/// this is the "empty group" case from the brief.
+fn finalize_and_upload(mut state: InsertState) -> FdwResult<()> {
+    // Tail flush for every group with rows still in builders.
+    let keys: Vec<PartitionTupleKey> = state.builders.keys().cloned().collect();
+    for key in &keys {
+        if state.rows_in_current_batch.get(key).copied().unwrap_or(0) > 0 {
+            flush_group(&mut state, key)?;
+        }
+    }
+
+    // Drain by-value so we can `finish()` each writer (consumes self) and
+    // upload. Sort by partition values so multi-group tests are stable.
+    let InsertState {
+        client,
+        writers,
+        target_names,
+        ..
+    } = state;
+    let mut entries: Vec<(PartitionTupleKey, ParquetBatchWriter)> = writers.into_iter().collect();
+    entries.sort_by(|a, b| a.0.values.cmp(&b.0.values));
+
+    for (key, writer) in entries {
+        let target_name = target_names.get(&key).cloned().ok_or_else(|| {
+            FdwError::SchemaMismatch(format!(
+                "no target_name registered for partition tuple key {:?}",
+                key.values
+            ))
+        })?;
+        let bytes = writer.finish()?;
+        let blob_writer = AzureBlobWriter::new(&client, &target_name);
+        runtime::block_on(blob_writer.upload(bytes))?;
+    }
     Ok(())
 }
 
@@ -709,4 +962,115 @@ unsafe fn pg_list_to_kv(list: *mut pg_sys::List) -> Vec<(String, String)> {
         out.push((name, value));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_target_layout_glob_strips_star_and_trailing_slash() {
+        let opts = TableOptions {
+            container: "c".into(),
+            filename: "events/year=2026/*".into(),
+            compression: Compression::Snappy,
+            parallel_workers: None,
+            partition_columns: vec!["year".into()],
+            partition_keys: vec![("year".into(), PgPartitionType::Int4)],
+            sorted: vec![],
+            files_in_order: false,
+        };
+        let (prefix, literal) = pick_target_layout(&opts);
+        assert_eq!(prefix, "events/year=2026");
+        assert!(literal.is_none());
+    }
+
+    #[test]
+    fn pick_target_layout_literal_preserves_full_name() {
+        let opts = TableOptions {
+            container: "c".into(),
+            filename: "dir/one.parquet".into(),
+            compression: Compression::Snappy,
+            parallel_workers: None,
+            partition_columns: vec![],
+            partition_keys: vec![],
+            sorted: vec![],
+            files_in_order: false,
+        };
+        let (prefix, literal) = pick_target_layout(&opts);
+        assert_eq!(prefix, "dir");
+        assert_eq!(literal.as_deref(), Some("dir/one.parquet"));
+    }
+
+    fn make_stub_state(
+        base_prefix: &str,
+        legacy: Option<&str>,
+        decls: Vec<(String, PgPartitionType)>,
+    ) -> InsertState {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema: SchemaRef =
+            std::sync::Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
+        // SasUrl client is parsed-only; we never touch the network in this test.
+        let client = crate::azure::AzureBlobClient::new(
+            "fake.invalid",
+            "fakeaccount",
+            crate::azure::Credential::SasUrl {
+                container_url: "http://127.0.0.1:1/c?sv=2024-11-04&sig=stub".into(),
+            },
+            "c",
+        )
+        .expect("client constructs from a parseable SAS URL");
+        InsertState {
+            schema,
+            pg_oids: Vec::new(),
+            client,
+            compression: Compression::Snappy,
+            partition_attnums: Vec::new(),
+            partition_keys_decl: decls,
+            base_prefix: base_prefix.to_string(),
+            legacy_single_target: legacy.map(|s| s.to_string()),
+            builders: HashMap::new(),
+            writers: HashMap::new(),
+            target_names: HashMap::new(),
+            rows_in_current_batch: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn compute_target_name_partitioned_emits_key_eq_val_segments() {
+        let state = make_stub_state(
+            "events",
+            None,
+            vec![
+                ("year".into(), PgPartitionType::Int4),
+                ("region".into(), PgPartitionType::Text),
+            ],
+        );
+        let key = PartitionTupleKey {
+            values: vec!["2026".into(), "us".into()],
+        };
+        let name = compute_target_name(&state, &key);
+        assert!(
+            name.starts_with("events/year=2026/region=us/"),
+            "got {name}"
+        );
+        assert!(name.ends_with(".parquet"));
+    }
+
+    #[test]
+    fn compute_target_name_empty_key_reuses_literal_when_present() {
+        let state = make_stub_state("dir", Some("dir/one.parquet"), Vec::new());
+        let key = PartitionTupleKey { values: Vec::new() };
+        let name = compute_target_name(&state, &key);
+        assert_eq!(name, "dir/one.parquet");
+    }
+
+    #[test]
+    fn compute_target_name_empty_key_glob_synthesizes_under_prefix() {
+        let state = make_stub_state("dir", None, Vec::new());
+        let key = PartitionTupleKey { values: Vec::new() };
+        let name = compute_target_name(&state, &key);
+        assert!(name.starts_with("dir/"), "got {name}");
+        assert!(name.ends_with(".parquet"));
+    }
 }

@@ -5,9 +5,13 @@
 //! (it carries `#![deny(unsafe_op_in_unsafe_fn)]` so each unsafe op is
 //! still individually opted into).
 
+pub mod glob;
+pub mod import_schema;
 #[allow(unsafe_code)]
 pub mod modify;
 pub mod options;
+pub mod parallel;
+pub mod partition;
 pub mod pg_op_oids;
 pub mod pushdown;
 #[allow(unsafe_code)]
@@ -48,6 +52,15 @@ pub fn build_routine() -> PgBox<pg_sys::FdwRoutine, AllocatedByRust> {
     r.ExecForeignUpdate = Some(modify::update::exec_foreign_update);
     r.ExecForeignDelete = Some(modify::update::exec_foreign_delete);
     r.EndForeignModify = Some(modify::end_foreign_modify);
+
+    r.ImportForeignSchema = Some(import_schema::import_foreign_schema);
+
+    // Parallel-scan callbacks (SP-3a).
+    r.IsForeignScanParallelSafe = Some(parallel::is_foreign_scan_parallel_safe);
+    r.EstimateDSMForeignScan = Some(parallel::estimate_dsm_foreign_scan);
+    r.InitializeDSMForeignScan = Some(parallel::initialize_dsm_foreign_scan);
+    r.ReInitializeDSMForeignScan = Some(parallel::re_initialize_dsm_foreign_scan);
+    r.InitializeWorkerForeignScan = Some(parallel::initialize_worker_foreign_scan);
 
     r
 }

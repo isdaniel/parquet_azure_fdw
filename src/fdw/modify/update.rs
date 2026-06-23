@@ -33,15 +33,14 @@
 use crate::azure::AzureBlobClient;
 use crate::convert::pg_to_arrow::{pg_attrs_to_arrow_schema, RecordBatchBuilders};
 use crate::error::{raise, FdwError, FdwResult};
-use crate::fdw::modify::kernel::{apply_edits, BlobEdits, RowOverride};
+use crate::fdw::modify::kernel::{apply_edits_batch, BlobEdits, RowOverride};
 use crate::fdw::modify::rowid::{RowId, CHUNK_ROWS};
 use crate::fdw::modify::BlobIdEntry;
-use crate::parquet_io::reader::{open_stream_from_bytes, ParquetReadOptions};
 use crate::parquet_io::writer::ParquetBatchWriter;
 use crate::parquet_io::Compression;
 use crate::runtime;
 
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::ArrayRef;
 use arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -293,6 +292,41 @@ pub unsafe fn build_plan(
         unsafe { crate::fdw::update_cols_for_subplan(mtstate, rinfo) }
     };
 
+    // SP-3b: UPDATE that touches a partition column is rejected — partition
+    // values are encoded in the blob path, not the parquet data; relocating
+    // requires DELETE + INSERT.
+    if !is_delete && !table_opts.partition_columns.is_empty() {
+        // Re-derive partition_attnums from table_opts; mirrors the resolution
+        // in `scan.rs::build_scan_state_core`.
+        // SAFETY: `rel`/`rd_att` are live for the duration of build_plan; the
+        // `tupdesc_attr` shim is the version-portable accessor; `attname` is
+        // a fixed-size NameData with a NUL-terminated C string in-bounds.
+        let (partition_attnums, attname_for): (Vec<usize>, Vec<String>) = unsafe {
+            let tupdesc = (*rel).rd_att;
+            let natts = (*tupdesc).natts as usize;
+            let mut names: Vec<String> = Vec::with_capacity(natts);
+            for i in 0..natts {
+                let att = crate::fdw::tupdesc_attr(tupdesc, i);
+                names.push(
+                    std::ffi::CStr::from_ptr((*att).attname.data.as_ptr() as *const _)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            let mut attnums = Vec::with_capacity(table_opts.partition_columns.len());
+            for name in &table_opts.partition_columns {
+                for (i, nm) in names.iter().enumerate() {
+                    if nm.eq_ignore_ascii_case(name) {
+                        attnums.push(i);
+                        break;
+                    }
+                }
+            }
+            (attnums, names)
+        };
+        reject_partition_update(&update_attnums, &partition_attnums, &attname_for)?;
+    }
+
     // --- resjunk ctid AttrNumber ----------------------------------------
     // The executor delivers the synthetic ctid we stamped during scan as a
     // resjunk column on the modify subplan's plan slot. On foreign tables
@@ -354,6 +388,33 @@ pub unsafe fn build_plan(
         ctid_attno,
         edit_count: 0,
     })
+}
+
+/// Pure helper: reject an UPDATE plan whose `update_attnums` intersect with
+/// `partition_attnums`. Extracted from `build_plan` so the rejection logic is
+/// directly unit-testable without a live `ModifyTableState`.
+///
+/// `attname_for` is indexed by 0-based attno (same as `update_attnums` and
+/// `partition_attnums`); the rejected column's name is interpolated into the
+/// SQLSTATE error message so the user sees which column they tried to update.
+pub(crate) fn reject_partition_update(
+    update_attnums: &[usize],
+    partition_attnums: &[usize],
+    attname_for: &[String],
+) -> FdwResult<()> {
+    for &col in update_attnums {
+        if partition_attnums.contains(&col) {
+            let pname = attname_for
+                .get(col)
+                .cloned()
+                .unwrap_or_else(|| format!("attno={col}"));
+            return Err(FdwError::SchemaMismatch(format!(
+                "cannot UPDATE partition column '{pname}' — partition values are \
+                 encoded in the blob path, not the parquet data. DELETE + INSERT to relocate."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Open just enough of a parquet blob to read its footer and return the row
@@ -736,11 +797,42 @@ pub fn commit_plan(plan: ModifyPlan) -> FdwResult<()> {
         //    parquet routinely compresses 5x-20x for dictionary-encoded or
         //    repetitive columns, and apply_edits' peak RSS scales with
         //    decoded size.
-        let mut s = runtime::block_on(open_stream_from_bytes(body, ParquetReadOptions::default()))?;
-        let mut batches: Vec<RecordBatch> = Vec::new();
+        // Build the stream via the underlying builder so we can peek the
+        // source's compression codec BEFORE consuming the stream.
+        let cursor = std::io::Cursor::new(body);
+        let builder = runtime::block_on(ParquetRecordBatchStreamBuilder::new(cursor))?;
+        // Probe column 0 of row group 0. Parquet permits per-column-chunk
+        // codecs, but the writer in this crate always uses one codec for
+        // the whole file; reading any one column chunk recovers it. For a
+        // mixed-codec source (rare; only from external writers), we
+        // re-encode using whatever the first column's codec was — still
+        // closer to the original intent than the table option.
+        let source_codec: Compression = if builder.metadata().num_row_groups() > 0
+            && builder.metadata().row_group(0).num_columns() > 0
+        {
+            Compression::from_parquet(builder.metadata().row_group(0).column(0).compression())
+        } else {
+            // Empty parquet file → no codec to preserve; fall through to
+            // the plan's table option for the rewrite.
+            plan.compression
+        };
+        let mut s = builder.build()?;
+
+        // Streaming rewrite: construct the writer up front (codec from the
+        // source, preserving SP-0 codec-fidelity), then push each source
+        // batch through the per-batch kernel and straight into the writer.
+        // Peak RSS is ~1 source batch + ~1 output batch + writer buffer +
+        // the (sparse) edits map — not the whole decoded blob.
+        let mut writer = ParquetBatchWriter::new(plan.schema.clone(), source_codec)?;
+        let mut offset: u64 = 0;
         let mut decoded_bytes: u64 = 0;
+        let mut total_rows: usize = 0;
         while let Some(batch) = runtime::block_on(s.next()) {
             let batch = batch?;
+            // Cumulative decoded-size cap — UNCHANGED 512 MiB ceiling. The
+            // streaming kernel lowers peak RSS but the cap still rejects a
+            // blob that decodes to more than MAX_BLOB_BYTES total. Raising
+            // the ceiling is a separate, measured SP.
             decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size() as u64);
             if decoded_bytes > crate::azure::MAX_BLOB_BYTES {
                 return Err(FdwError::Azure(format!(
@@ -750,16 +842,30 @@ pub fn commit_plan(plan: ModifyPlan) -> FdwResult<()> {
                     cap = crate::azure::MAX_BLOB_BYTES
                 )));
             }
-            batches.push(batch);
+            let out = apply_edits_batch(&batch, offset, &plan.schema, edits)?;
+            offset += batch.num_rows() as u64;
+            total_rows += out.num_rows();
+            if out.num_rows() > 0 {
+                writer.write(&out)?;
+            }
         }
 
-        // 3) Apply edits via the pure kernel.
-        let out = apply_edits(batches, plan.schema.clone(), edits)?;
-        let total_rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        // Range-validate every update key against the blob's true row count
+        // (`offset` after the loop). Replaces the old whole-blob `row >=
+        // nrows` check — under streaming an out-of-range override would
+        // otherwise silently never apply.
+        for &k in edits.updates.keys() {
+            if k >= offset {
+                return Err(FdwError::SchemaMismatch(format!(
+                    "update row {k} >= blob '{name}' row count {offset}"
+                )));
+            }
+        }
 
         if total_rows == 0 {
             // No staging blob — Phase 2 will DELETE the original under
-            // If-Match: scan_etag.
+            // If-Match: scan_etag. (Drop the writer; we never finish it.)
+            drop(writer);
             staged.push(Staged {
                 original_name: name,
                 scan_etag,
@@ -770,12 +876,7 @@ pub fn commit_plan(plan: ModifyPlan) -> FdwResult<()> {
             continue;
         }
 
-        // 4) Encode new parquet bytes and stage under a `*.tmp.<uuid>` name
-        //    via If-None-Match (so we never overwrite an existing blob).
-        let mut writer = ParquetBatchWriter::new(plan.schema.clone(), plan.compression)?;
-        for b in &out {
-            writer.write(b)?;
-        }
+        // Finalize the parquet footer and stage under a `*.tmp.<uuid>` name.
         let bytes = writer.finish()?;
 
         let staging_name = make_staging_name(&name);
@@ -917,5 +1018,40 @@ mod tests {
         }
         assert_eq!(plan.edit_count, 5);
         assert_eq!(plan.edits.get(&0).expect("entry").deletes.len(), 5);
+    }
+
+    /// SP-3b Task 6, Step 2: UPDATE that SETs a partition column must be
+    /// rejected with the spec'd message. The check lives in `build_plan` and
+    /// is exercised here through the extracted `reject_partition_update`
+    /// helper so we don't need a live `ModifyTableState`.
+    #[test]
+    fn reject_partition_update_errors_when_set_touches_partition_col() {
+        // Tupdesc: ["year" (partition), "region" (partition), "v" (storage)].
+        let names = vec!["year".to_string(), "region".to_string(), "v".to_string()];
+        let partition_attnums = vec![0usize, 1];
+        // UPDATE t SET region = 'us' WHERE ... — touches attno 1.
+        let update_attnums = vec![1usize];
+        let err = reject_partition_update(&update_attnums, &partition_attnums, &names)
+            .expect_err("touching a partition col must be rejected");
+        match err {
+            FdwError::SchemaMismatch(msg) => {
+                assert!(
+                    msg.contains("cannot UPDATE partition column 'region'"),
+                    "{msg}"
+                );
+                assert!(msg.contains("DELETE + INSERT"), "{msg}");
+            }
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_partition_update_passes_when_storage_only() {
+        let names = vec!["year".to_string(), "region".to_string(), "v".to_string()];
+        let partition_attnums = vec![0usize, 1];
+        // UPDATE t SET v = v + 1 — touches storage attno 2 only.
+        let update_attnums = vec![2usize];
+        reject_partition_update(&update_attnums, &partition_attnums, &names)
+            .expect("storage-only update must pass");
     }
 }
